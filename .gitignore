@@ -1,0 +1,24 @@
+# ---- Rust ----
+target/
+**/target/
+
+# ---- Node ----
+node_modules/
+dist/
+*.local
+
+# ---- 素材（大文件，不入库；从上游获取或发布产物提供）----
+assets/frames/
+assets/videos/
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+
+# ---- 构建产物 ----
+*.dmg
+*.msi
+*.exe
+*.app

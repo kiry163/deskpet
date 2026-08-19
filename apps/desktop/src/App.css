@@ -1,0 +1,21 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  color: #0f0f0f;
+  /* 窗口整体透明：body/html 背景必须透明 */
+  background-color: transparent;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+canvas {
+  display: block;
+}

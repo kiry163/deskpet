@@ -1,0 +1,16 @@
+[package]
+name = "webm2frames"
+version = "0.1.0"
+edition = "2021"
+description = "VP9+alpha webm → RGBA 帧序列转换工具（解码模块移植自 ianlike-ui/dsh-pet-standalone，其素材与逻辑源自 MIT 协议的 PC2005-cloud/dsh-pet）"
+
+[dependencies]
+image = { version = "0.25", features = ["png", "webp"] }
+
+[[bin]]
+name = "webm2frames"
+path = "src/main.rs"
+
+[[bin]]
+name = "decode_check"
+path = "src/decode_check.rs"
