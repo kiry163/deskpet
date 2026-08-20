@@ -13,6 +13,7 @@ mod menu;
 mod monitor;
 mod pet;
 mod platform;
+mod single_instance;
 mod state;
 mod tray;
 mod vpx;
@@ -29,6 +30,15 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     );
+
+    // 单实例：已有实例运行则直接退出（重复双击/自启竞态）
+    let _lock = match single_instance::acquire() {
+        Some(l) => l,
+        None => {
+            log_info!("已有 deskpet 实例在运行，本实例退出");
+            return;
+        }
+    };
 
     #[cfg(windows)]
     unsafe {

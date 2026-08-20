@@ -7,6 +7,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Windows：嵌入 exe 图标资源（resources/deskpet.rc → deskpet.ico）
+    #[cfg(windows)]
+    embed_resource::compile("resources/deskpet.rc", embed_resource::NONE);
+
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let target = env::var("TARGET").unwrap_or_default();
     if target.contains("apple-darwin") {
