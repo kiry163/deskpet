@@ -1,0 +1,47 @@
+[package]
+name = "deskpet"
+version = "0.1.0"
+edition = "2021"
+description = "deskpet 桌宠 —— 原生实现（Windows Win32 / macOS AppKit），fork 自 ianlike-ui/dsh-pet-standalone (MIT)"
+
+[[bin]]
+name = "deskpet"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSValue", "NSGeometry", "NSArray", "NSURL", "NSTimer", "NSDate", "block2",
+    "NSObject",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSWindow", "NSView", "NSMenu", "NSMenuItem", "NSStatusItem",
+    "NSStatusBar", "NSImage", "NSScreen", "NSEvent", "NSGraphicsContext", "NSColor",
+    "NSGraphics", "NSResponder", "NSControl",
+] }
+objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGImage"] }
