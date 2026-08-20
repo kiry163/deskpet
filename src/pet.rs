@@ -249,8 +249,8 @@ impl Pet {
             if idx >= clip.frame_count() {
                 return;
             }
-            if let Some(frame) = clip.next_frame() {
-                clip.cur = idx; // 不推进
+            let frame = clip.next_frame();
+            if let Some(frame) = frame {
                 let dst_h = self.render_buf.len() / (w * 4);
                 self.render_buf.fill(0);
                 for y in 0..h {
@@ -261,6 +261,8 @@ impl Pet {
                     let d = (pad + y) * w * 4;
                     self.render_buf[d..d + w * 4].copy_from_slice(&frame[s..s + w * 4]);
                 }
+                // frame 借用结束；还原 cur（预览不推进）
+                clip.cur = idx;
                 self.win.resize(dw, dh);
                 self.win.present(&self.render_buf, w, dst_h, self.facing_right);
             }
@@ -539,15 +541,18 @@ impl Pet {
         let (dw, dh) = self.window_size();
         let pad = (state::PAD * self.scale).round() as usize;
         let anim = self.cur_anim.clone();
-        let frame: Option<(Vec<u8>, usize, usize)> = match self.clips.get_mut(&anim) {
-            Some(clip) => match clip.next_frame() {
-                Some(f) => Some((f, clip.webm.width as usize, clip.webm.height as usize)),
-                None => None,
-            },
+        let (mut w, mut h) = (0usize, 0usize);
+        let frame: Option<&[u8]> = match self.clips.get_mut(&anim) {
+            Some(clip) => {
+                // 先取尺寸（借用立即结束），再借可变 next_frame
+                w = clip.webm.width as usize;
+                h = clip.webm.height as usize;
+                clip.next_frame()
+            }
             None => None,
         };
         match frame {
-            Some((frame, w, h)) => {
+            Some(frame) => {
                 let dst_h = self.render_buf.len() / (w * 4);
                 self.render_buf.fill(0);
                 for y in 0..h {

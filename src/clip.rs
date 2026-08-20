@@ -16,6 +16,8 @@ pub struct ClipDecoder {
     pub cur: usize,
     // 查找表
     ytab: [i32; 256],
+    /// 合成输出缓冲（复用，避免每帧分配 ~921KB）
+    out: Vec<u8>,
 }
 
 impl ClipDecoder {
@@ -34,6 +36,7 @@ impl ClipDecoder {
             alpha_dec,
             cur: 0,
             ytab,
+            out: Vec::new(),
         })
     }
 
@@ -68,12 +71,13 @@ impl ClipDecoder {
     }
 
     /// 解码并返回当前帧 BGRA（premultiplied alpha），推进到下一帧。
-    /// 返回 None 表示播完。
-    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+    /// 返回借用的合成缓冲（复用，不重新分配）；None 表示播完。
+    pub fn next_frame(&mut self) -> Option<&[u8]> {
         if self.cur >= self.webm.frames.len() {
             return None;
         }
-        let f = self.webm.frames[self.cur].clone();
+        // 借用帧数据（不 clone，避免每帧 ~921KB 拷贝 + 分配）
+        let f = &self.webm.frames[self.cur];
         self.cur += 1;
         let color = self.color_dec.decode(&f.video)?;
         let alpha = match &f.alpha {
@@ -83,16 +87,19 @@ impl ClipDecoder {
             }
             None => None,
         };
-        Some(compose(color, alpha, &self.ytab))
+        compose_into(color, alpha, &self.ytab, &mut self.out);
+        Some(&self.out)
     }
 }
 
-/// 合成 I420 主色 + 可选 alpha（灰度 I420 的 Y 平面）→ BGRA premultiplied。
-fn compose(color: &vpx_image_t, alpha: Option<&vpx_image_t>, ytab: &[i32; 256]) -> Vec<u8> {
+/// 合成 I420 主色 + 可选 alpha（灰度 I420 的 Y 平面）→ BGRA premultiplied，
+/// 写入复用缓冲 out（避免每帧分配 ~921KB）。
+fn compose_into(color: &vpx_image_t, alpha: Option<&vpx_image_t>, ytab: &[i32; 256], out: &mut Vec<u8>) {
     // libvpx 输出的 w/h 是存储对齐尺寸，d_w/d_h 才是实际像素尺寸
     let w = color.d_w as usize;
     let h = color.d_h as usize;
-    let mut out = vec![0u8; w * h * 4];
+    out.resize(w * h * 4, 0);
+    let out = out.as_mut_slice();
 
     let yp = color.planes[VPX_PLANE_Y];
     let up = color.planes[VPX_PLANE_U];
@@ -141,5 +148,4 @@ fn compose(color: &vpx_image_t, alpha: Option<&vpx_image_t>, ytab: &[i32; 256]) 
             out[o + 3] = a;
         }
     }
-    out
 }
