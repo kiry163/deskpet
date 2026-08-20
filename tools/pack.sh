@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 打包 macOS 发布 zip：deskpet（仅二进制）+ LICENSE + 使用说明。
+# 打包 macOS 发布 dmg：deskpet.app（应用包，双击即运行）+ LICENSE + 使用说明。
 # 素材不随包分发：发布物仅二进制，素材由用户经控制台导入（docs/需求规格.md §3）。
 # 用法（仓库根）：
-#   bash tools/pack.sh            # 构建前端（如需）+ release 并打包
+#   bash tools/pack.sh            # 构建前端（如需）+ release 并打包 dmg
 #   bash tools/pack.sh --no-build # 跳过前端与 Rust 构建，仅打包已存在的 target/release/deskpet
 # 环境变量：
 #   CARGO_EXTRA  追加到 cargo build 的参数（如 crates.io 不可达时指定镜像，见下）
@@ -56,25 +56,69 @@ if [ ! -x "$bin" ]; then
   exit 1
 fi
 
-# 3. 组装临时目录（仅二进制 + LICENSE + 说明；不含素材）
 name="deskpet-v${version}-macos-${arch}"
 stage="target/pack/$name"
+app="$stage/deskpet.app"
 rm -rf "$stage"
-mkdir -p "$stage"
-cp "$bin" "$stage/deskpet"
-cp LICENSE "$stage/"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
+# 3. 组装 deskpet.app（LSUIElement=1：纯状态栏应用，不出现在 Dock；双击即运行，
+#    可拖入 Applications，无需安装）。.app 是目录结构，本质仍是单个二进制。
+cp "$bin" "$app/Contents/MacOS/deskpet"
+
+# 图标：resources/deskpet.png → icns（iconutil 需要 .iconset 目录）
+if [ -f resources/deskpet.png ]; then
+  iconset="$(mktemp -d)/deskpet.iconset"
+  mkdir -p "$iconset"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" resources/deskpet.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  done
+  sips -z 32 32 resources/deskpet.png --out "$iconset/icon_16x16@2x.png" >/dev/null
+  sips -z 64 64 resources/deskpet.png --out "$iconset/icon_32x32@2x.png" >/dev/null
+  sips -z 256 256 resources/deskpet.png --out "$iconset/icon_128x128@2x.png" >/dev/null
+  sips -z 512 512 resources/deskpet.png --out "$iconset/icon_256x256@2x.png" >/dev/null
+  sips -z 1024 1024 resources/deskpet.png --out "$iconset/icon_512x512@2x.png" >/dev/null
+  iconutil -c icns "$iconset" -o "$app/Contents/Resources/deskpet.icns"
+  rm -rf "$(dirname "$iconset")"
+fi
+
+cat > "$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>deskpet</string>
+    <key>CFBundleDisplayName</key><string>deskpet</string>
+    <key>CFBundleIdentifier</key><string>com.kiry.deskpet</string>
+    <key>CFBundleExecutable</key><string>deskpet</string>
+    <key>CFBundleIconFile</key><string>deskpet</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>${version}</string>
+    <key>CFBundleVersion</key><string>${version}</string>
+    <key>LSMinimumSystemVersion</key><string>10.13</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+EOF
+
+# ad-hoc 签名：本地有效签名，消除部分"无法验证开发者"报错
+# （从网络下载的 dmg/app 仍可能触发 Gatekeeper，需右键 → 打开，见 README）
+codesign --force --deep -s - "$app" >/dev/null 2>&1 || true
+
+# 4. dmg 内容：deskpet.app + Applications 快捷方式 + LICENSE + 使用说明
+cp LICENSE "$stage/"
 cat > "$stage/README.txt" <<EOF
 deskpet 桌宠 v${version}（macOS ${arch}）
 
 发布物仅二进制：素材不随包分发，首次运行后请经控制台导入素材包。
 
 快速开始：
-1. 双击 deskpet 启动（首次如被 Gatekeeper 拦截：右键 deskpet → 打开；
-   或终端执行 xattr -dr com.apple.quarantine deskpet）；
-2. 状态栏图标 → 菜单「打开控制台」，浏览器打开管理界面
+1. 把 deskpet.app 拖入 Applications（可选：放任意位置双击也能运行）；
+2. 双击 deskpet.app 启动（如被 Gatekeeper 拦截：右键 deskpet.app → 打开）；
+3. 状态栏图标 → 菜单「打开控制台」，浏览器打开管理界面
    （地址也可读 ~/Library/Application Support/deskpet/control.json 中的 url）；
-3. 控制台「导入」页上传素材 zip 包（zip 根 = manifest.json + videos/），
+4. 控制台「导入」页上传素材 zip 包（zip 根 = manifest.json + videos/），
    校验通过后自动解压到素材根并热加载（无需重启）。
 
 退出：状态栏图标右键菜单 → 退出。
@@ -89,10 +133,11 @@ deskpet 桌宠 v${version}（macOS ${arch}）
 动画与交互设计源自 ianlike-ui/dsh-pet-standalone（MIT）、PC2005-cloud/dsh-pet（MIT）
 与 MerZlin/dsh-pet-indesktop，特此致谢。
 EOF
+ln -s /Applications "$stage/Applications"
 
-# 4. 压缩
-zip_path="target/${name}.zip"
-rm -f "$zip_path"
-(cd target/pack && zip -rq "../${name}.zip" "$name")
+# 5. 制作 dmg（UDZO 压缩镜像；不再产出 zip）
+dmg_path="target/${name}.dmg"
+rm -f "$dmg_path"
+hdiutil create -volname "deskpet v${version}" -srcfolder "$stage" -ov -format UDZO "$dmg_path" >/dev/null
 rm -rf "$stage"
-echo "打包完成: $zip_path"
+echo "打包完成: $dmg_path"

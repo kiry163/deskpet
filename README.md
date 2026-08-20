@@ -68,6 +68,16 @@
 > crates.io 不可达时（本机实测），cargo 命令需带 rsproxy 镜像参数：
 > `--config 'source.crates-io.replace-with="rsproxy-sparse"' --config 'source.rsproxy-sparse.registry="sparse+https://rsproxy.cn/index/"'`
 
+## 打包发布
+
+- **macOS**：`bash tools/pack.sh` → `target/deskpet-v<版本>-macos-<架构>.dmg`
+  （内含 `deskpet.app`：双击即运行、可拖入 Applications，无需安装；LSUIElement
+  状态栏应用，不出现在 Dock；附 ad-hoc 签名与应用图标）
+- **Windows**：`powershell -ExecutionPolicy Bypass -File tools\pack.ps1` →
+  单个 `target\deskpet-v<版本>-windows-x64.exe`（零依赖，双击即运行）
+- 发布物**仅二进制**：素材不随包分发，首次运行后经控制台「导入」页上传素材 zip 包；
+  crates.io 不可达时设 `CARGO_EXTRA` 传 rsproxy 镜像参数（见 pack.sh 注释）
+
 ### macOS 真机验证（2025 完成）
 
 - 穿透：`ignoresMouseEvents` 按光标位置逐 tick 切换（窗口服务器层真穿透）——真机验证通过
