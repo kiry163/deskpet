@@ -5,7 +5,7 @@
 
 - Windows：Win32 原生（`CreateWindowExW` + `UpdateLayeredWindow` 透明窗口、托盘、注册表自启）——**已实现并验证**
 - macOS：AppKit 原生（`NSWindow` 透明 + `NSView` 逐帧 `drawRect` 渲染、`NSStatusItem` 托盘、
-  LaunchAgent 自启）——**已实现（代码通过 cargo check），待真机运行验证**
+  LaunchAgent 自启）——**已实现并真机验证（2025）**
 
 > **声明与致谢**：本项目 fork 自
 > [ianlike-ui/dsh-pet-standalone](https://github.com/ianlike-ui/dsh-pet-standalone)（MIT）。
@@ -23,7 +23,8 @@
 - 拖拽：Windows `SetCapture` / macOS AppKit 按下期间隐式捕获 + 全局坐标跟手
 - 托盘右键菜单：回到右下角 / 窗口置顶 / 不移动 / 开机自启 / 大小（50% 72% 85% 100%）/ 显示隐藏 / 退出
   （桌宠身上不再弹右键菜单，全部集中到托盘）
-- 鼠标悬停桌宠 → 手型光标，提示可交互（点击回应 / 拖拽）
+- 鼠标悬停桌宠 → 手型光标，提示可交互（点击回应 / 拖拽）——**仅 Windows**（macOS 因逐 tick
+  穿透切换，窗口服务器不支持光标样式，悬停手型已放弃）
 - 开机自启：Windows `HKCU\...\Run`；macOS `~/Library/LaunchAgents/com.kiry.deskpet.plist`
 - 配置：Windows `%APPDATA%\deskpet\config.json`；macOS `~/Library/Application Support/deskpet/config.json`
   （首次运行自动从旧版 Tauri 应用配置迁移）
@@ -55,15 +56,13 @@
 
 > 跨平台类型检查（无需 Mac）：`DESKPET_ALLOW_NO_LIBVPX=1 cargo check --target aarch64-apple-darwin`
 
-### macOS 待验证项（代码已就绪，需真机确认）
+### macOS 真机验证（2025 完成）
 
-- 穿透机制：采用「`ignoresMouseEvents` 按光标位置逐 tick 切换」（窗口服务器层真穿透，
-  透明像素点击会落到下层窗口；光标位于不透明像素上时关闭穿透以接收交互）——需真机确认
-  切换时机与拖拽期间事件流正常
-- 视图未翻转时 `CGContextDrawImage` 的正立渲染（若上下颠倒，改为翻转上下文）
-- 坐标换算（主屏高度、backingScaleFactor、状态栏按钮宽高）
-- `popUpMenuPositioningItem` 弹出菜单中 target-action 的触发时机
-  （按 AppKit 行为，菜单跟踪时选中项即触发 action，经全局 handler 按 tag 分发命令）
+- 穿透：`ignoresMouseEvents` 按光标位置逐 tick 切换（窗口服务器层真穿透）——真机验证通过
+- `CGContextDrawImage` 正立渲染、Retina 坐标换算、状态栏菜单——真机验证通过
+- 修复：`CGBitmapContextCreate` 字节序常量非法 → 渲染全透明 + 托盘图标缺失；macOS ld
+  优先 dylib → build.rs 改传 `libvpx.a` 绝对路径强制静态链接
+- 未完整验证：LaunchAgent 自启；macOS 悬停手型光标不支持（穿透机制限制，已放弃）
 
 ## 运行
 
@@ -116,7 +115,7 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
   （`win32.rs` / `macos.rs`）；菜单为数据驱动（`menu.rs`）
 - **macOS 后端为全新编写**（上游无原生 macOS 实现；参考行为：动画链/交互与 Win32 版一致）
 - 功能保留：点击回应、拖拽、置顶、不移动、自启、4 档大小、回到右下角、托盘；
-  新增：托盘右键完整菜单、悬停手型光标
+  新增：托盘右键完整菜单、悬停手型光标（仅 Windows）
 
 ## 验证工具
 
