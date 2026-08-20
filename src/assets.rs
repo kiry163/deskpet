@@ -31,8 +31,9 @@ pub struct RoleAssets {
 }
 
 /// 素材根目录解析：配置 > 环境变量 DESKPET_ASSETS_DIR > 配置目录 assets/（若存在）>
-/// exe 旁 assets/ > 当前目录 assets/。默认素材根 = 配置目录 assets/（M1 决策，
-/// 发布物仅二进制后 exe 旁可能只读；首次导入后该目录即存在）。
+/// exe 旁 assets/ > 当前目录 assets/ > 兜底配置目录 assets/（不存在则创建）。
+/// 兜底保证 .app 从任意位置启动（Applications / Finder，cwd=/）时导入仍落到
+/// 可写的配置目录，不会解析到只读路径（如 /assets）导致桌宠创建/导入失败。
 pub fn resolve_assets_dir(configured: Option<&str>, config_dir: &Path) -> PathBuf {
     if let Some(d) = configured {
         if !d.trim().is_empty() {
@@ -61,7 +62,9 @@ pub fn resolve_assets_dir(configured: Option<&str>, config_dir: &Path) -> PathBu
     if a.is_dir() {
         return a;
     }
-    a
+    // 兜底：配置目录 assets/（首次导入前目录尚不存在也用它，并创建）
+    let _ = std::fs::create_dir_all(&cfg_assets);
+    cfg_assets
 }
 
 /// 从素材根目录加载角色。失败返回 None（无目录/无素材/解析全部失败）。
