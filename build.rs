@@ -78,7 +78,7 @@ fn resolve_videos_dir(manifest: &Path) -> PathBuf {
         return local;
     }
     panic!(
-        "找不到 webm 素材目录。请先运行 tools/fetch-webm-assets.ps1（或 .sh）获取素材，\
+        "找不到 webm 素材目录。请从上游 ianlike-ui/dsh-pet-standalone 的 assets/videos 复制素材，\
          或用环境变量 DESKPET_VIDEOS_DIR 指向素材目录。"
     );
 }

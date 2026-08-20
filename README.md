@@ -37,8 +37,8 @@
 1. **libvpx**（推荐 vcpkg）：`vcpkg install libvpx:x64-windows`，构建时设
    `set VPX_LIB_DIR=C:\path\to\vcpkg\installed\x64-windows\lib`。
    或按上游方式编译出 `vendor_libvpx/x64/Release/vpxmd.lib`。
-2. **素材**：`powershell -ExecutionPolicy Bypass -File tools\fetch-webm-assets.ps1`
-   （build.rs 也支持 `DESKPET_VIDEOS_DIR` 覆盖素材目录）。
+2. **素材**：从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制 51 个 webm 到
+   本仓库 `assets/videos/`（或设 `DESKPET_VIDEOS_DIR` 指向素材目录）。
 3. `cargo build --release` → `target\release\deskpet.exe`（约 36MB 单文件）。
 
 ### macOS
@@ -47,7 +47,8 @@
 
 1. **libvpx**：`brew install libvpx`（或 vcpkg；build.rs 自动探测
    `VPX_LIB_DIR` > `VCPKG_ROOT/installed/*-osx/lib` > `/opt/homebrew/lib` > `/usr/local/lib`）。
-2. **素材**：`tools/fetch-webm-assets.ps1` 或 `DESKPET_VIDEOS_DIR`。
+2. **素材**：同 Windows——从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制，或设
+   `DESKPET_VIDEOS_DIR` 指向素材目录。
 3. 在 Mac 上：`cargo build --release`，运行 `target/release/deskpet`。
 
 > 跨平台类型检查（无需 Mac）：`DESKPET_ALLOW_NO_LIBVPX=1 cargo check --target aarch64-apple-darwin`
