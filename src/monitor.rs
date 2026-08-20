@@ -15,7 +15,9 @@ mod win32_monitor {
         unsafe {
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0);
         }
-        (r.left, r.top, r.right, r.bottom)
+        let out = (r.left, r.top, r.right, r.bottom);
+        log_debug!("主屏工作区: {:?}", out);
+        out
     }
 }
 
@@ -36,7 +38,9 @@ mod macos_monitor {
         let t = h - vis.origin.y - vis.size.height;
         let r = vis.origin.x + vis.size.width;
         let b = h - vis.origin.y;
-        (l as i32, t as i32, r as i32, b as i32)
+        let out = (l as i32, t as i32, r as i32, b as i32);
+        log_debug!("主屏工作区: {:?}", out);
+        out
     }
 }
 

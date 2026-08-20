@@ -1,6 +1,8 @@
 //! deskpet 桌宠 —— 原生实现（Windows Win32 / macOS AppKit），libvpx 静态链接，单文件。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use]
+mod log;
 mod app;
 mod assets;
 mod autostart;
@@ -21,6 +23,16 @@ mod win32;
 mod macos;
 
 fn main() {
+    // 参数解析：--console（Windows release 附加父终端输出日志；macOS 忽略）
+    let attach_console = std::env::args().any(|a| a == "--console");
+    log::init(attach_console);
+    log_info!(
+        "deskpet {} 启动 (os={}, console={})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        attach_console
+    );
+
     #[cfg(windows)]
     unsafe {
         // 感知 DPI（物理像素坐标，避免缩放失真）
@@ -30,6 +42,7 @@ fn main() {
 
     let mut app = app::App::new();
     if app.pet.is_none() {
+        log_error!("桌宠初始化失败（素材加载或窗口创建失败），退出");
         return;
     }
 
@@ -40,7 +53,10 @@ fn main() {
         // 托盘图标：从当前帧生成
         let icon = generate_icon(&mut app);
         let mut tray = tray::Tray::new();
-        let _ = tray.add(app.primary_hwnd(), icon, "deskpet 桌宠");
+        if !tray.add(app.primary_hwnd(), icon, "deskpet 桌宠") {
+            log_warn!("托盘图标添加失败");
+        }
+        log_info!("桌宠窗口已创建，进入消息循环");
         // 消息循环
         let _ = win32::message_loop();
         app.save_position();

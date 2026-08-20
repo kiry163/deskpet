@@ -36,6 +36,8 @@ impl App {
             let mut pet = Pet::new(win, &role, &app.cfg.pet);
             pet.restore_position(&app.cfg.pet);
             app.pet = Some(pet);
+        } else {
+            log_error!("透明窗口创建失败");
         }
         app
     }
@@ -67,6 +69,7 @@ impl App {
 
     /// 处理托盘菜单命令。
     pub fn handle_tray_command(&mut self, cmd: usize) {
+        log_debug!("执行托盘命令: {}", cmd);
         match cmd {
             crate::tray::TRAY_TOGGLE_VISIBLE => self.toggle_visible(),
             crate::tray::TRAY_AUTOSTART => {
@@ -108,6 +111,7 @@ impl App {
 
     /// 处理宠物右键菜单命令（自启全局命令 + 宠物自身命令）。
     pub fn handle_command(&mut self, cmd: usize) {
+        log_debug!("执行菜单命令: {}", cmd);
         if cmd == pet::MID_AUTOSTART {
             let on = !crate::autostart::is_enabled();
             crate::autostart::set_enabled(on);

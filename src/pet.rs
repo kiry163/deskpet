@@ -68,6 +68,15 @@ fn build_from_role(role: &RoleAssets) -> (HashMap<String, ClipDecoder>, Category
         Some(&role.folder_files)
     };
     let cats = state::build_categories(&role.names, role.manifest.as_ref(), folder_files);
+    log_info!(
+        "动画分类: idle={:?} turn={:?} moves={} clicks={} drag={:?} acts={}",
+        cats.idle,
+        cats.turn,
+        cats.moves.len(),
+        cats.clicks.len(),
+        cats.drag,
+        cats.acts.len()
+    );
     (clips, cats)
 }
 
@@ -115,6 +124,7 @@ impl Pet {
         if self.cur_anim == name {
             return;
         }
+        log_debug!("切换动画: {} -> {}", self.cur_anim, name);
         self.cancel_move();
         self.cur_anim = name.to_string();
         if let Some(clip) = self.clips.get_mut(&self.cur_anim) {

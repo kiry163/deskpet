@@ -65,8 +65,12 @@ impl Config {
         if let Ok(text) = fs::read_to_string(&path) {
             if let Ok(pet) = serde_json::from_str::<PetConfig>(&text) {
                 cfg.pet = pet;
+                log_debug!("读取配置: {}", path.display());
                 return cfg;
             }
+            log_warn!("配置解析失败，使用默认值: {}", path.display());
+        } else {
+            log_debug!("配置文件不存在，使用默认值: {}", path.display());
         }
         cfg.migrate_from_tauri();
         cfg
@@ -93,11 +97,17 @@ impl Config {
             crate::autostart::set_enabled(true);
         }
         // 旧版 x/y 是绝对像素坐标，不迁移（原生版用归一化 rx/ry，位置重新确定）
+        log_info!(
+            "从旧版 Tauri 配置迁移: scale={} no_move={} always_on_top={} facing_right={} ({}), 来源: {}",
+            self.pet.scale, self.pet.no_move, self.pet.always_on_top, self.pet.facing_right,
+            self.pet.rx.map(|_| "有位置").unwrap_or("无位置"), legacy.display()
+        );
     }
 
     pub fn save(&self) {
         let _ = fs::create_dir_all(&self.dir);
         let json = serde_json::to_string_pretty(&self.pet).unwrap_or_default();
         let _ = fs::write(self.dir.join("config.json"), json);
+        log_debug!("保存配置: {}", self.dir.join("config.json").display());
     }
 }

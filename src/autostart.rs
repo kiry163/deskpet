@@ -47,6 +47,7 @@ mod win32_autostart {
             RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key)
         };
         if status != 0 {
+            log_debug!("开机自启: 关（注册表键不存在）");
             return false;
         }
         let name = value_name();
@@ -63,6 +64,7 @@ mod win32_autostart {
             )
         };
         let _ = unsafe { windows_sys::Win32::System::Registry::RegCloseKey(key) };
+        log_debug!("开机自启: {}", if r == 0 { "开" } else { "关" });
         r == 0
     }
 
@@ -81,6 +83,7 @@ mod win32_autostart {
             RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_SET_VALUE, &mut key)
         };
         if status != 0 {
+            log_warn!("开启开机自启失败（打开注册表键失败, status={:#x}）", status);
             return;
         }
         let cmd: Vec<u16> = format!("\"{}\"", exe_path())
@@ -98,6 +101,7 @@ mod win32_autostart {
             );
             windows_sys::Win32::System::Registry::RegCloseKey(key);
         }
+        log_info!("已开启开机自启: {}", exe_path());
     }
 
     fn disable() {
@@ -107,6 +111,7 @@ mod win32_autostart {
             RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_SET_VALUE, &mut key)
         };
         if status != 0 {
+            log_warn!("关闭开机自启失败（打开注册表键失败, status={:#x}）", status);
             return;
         }
         unsafe {
@@ -114,6 +119,7 @@ mod win32_autostart {
             windows_sys::Win32::System::Registry::RegCloseKey(key);
         }
         let _ = GetLastError;
+        log_info!("已关闭开机自启");
     }
 }
 
@@ -132,7 +138,9 @@ mod macos_autostart {
     }
 
     pub fn is_enabled() -> bool {
-        plist_path().is_file()
+        let r = plist_path().is_file();
+        log_debug!("开机自启: {}", if r { "开" } else { "关" });
+        r
     }
 
     pub fn set_enabled(on: bool) {
@@ -163,10 +171,13 @@ mod macos_autostart {
             exe.display()
         );
         let _ = std::fs::write(&path, plist);
+        log_info!("已开启开机自启: {}", path.display());
     }
 
     fn disable() {
-        let _ = std::fs::remove_file(plist_path());
+        let path = plist_path();
+        let _ = std::fs::remove_file(&path);
+        log_info!("已关闭开机自启");
     }
 }
 

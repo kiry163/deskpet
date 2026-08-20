@@ -31,16 +31,25 @@ pub struct RoleAssets {
 
 /// 从内嵌 ASSET_PAK 加载全部 webm。
 pub fn load_builtin() -> Option<RoleAssets> {
+    log_debug!("加载内置素材（{} 段动画）", ANIMS.len());
     let mut videos: HashMap<String, Rc<WebM>> = HashMap::new();
+    let mut failed: Vec<&str> = Vec::new();
     for (name, start, len) in ANIMS {
         let data = &ASSET_PAK[*start..*start + *len];
         if let Some(wm) = WebM::parse(data) {
             videos.insert(name.to_string(), Rc::new(wm));
+        } else {
+            failed.push(name);
         }
     }
     if videos.is_empty() {
+        log_error!("素材解析全部失败（共 {} 段），无法启动", ANIMS.len());
         return None;
     }
+    if !failed.is_empty() {
+        log_warn!("{} 段素材解析失败: {:?}", failed.len(), failed);
+    }
+    log_info!("素材加载完成: {} 段动画", videos.len());
     let names: Vec<String> = videos.keys().cloned().collect();
     Some(RoleAssets {
         videos,
