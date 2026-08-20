@@ -8,7 +8,9 @@ mod assets;
 mod autostart;
 mod clip;
 mod config;
+mod control;
 mod gfx;
+mod import;
 mod menu;
 mod monitor;
 mod pet;
@@ -47,10 +49,14 @@ fn main() {
     }
     state::init_random();
 
-    let mut app = app::App::new();
-    if app.pet.is_none() {
-        log_error!("桌宠初始化失败（素材加载或窗口创建失败），退出");
-        std::process::exit(1);
+    // 本地 HTTP 控制服务（管理前端 + JSON API）：命令通道 → 主线程 tick 排空
+    let (api_tx, api_rx) = std::sync::mpsc::channel();
+    let mut app = app::App::new(api_rx);
+    let assets_root =
+        crate::assets::resolve_assets_dir(app.cfg.pet.assets_dir.as_deref(), &app.cfg.dir);
+    app.console = control::ControlServer::start(api_tx, app.cfg.dir.clone(), assets_root);
+    if app.console.is_none() {
+        log_error!("控制服务启动失败（端口绑定失败）");
     }
 
     #[cfg(windows)]
@@ -95,13 +101,16 @@ mod win32_main {
         let size = 32i32;
         let (dw, dh) = (size as usize, size as usize);
 
-        let pet = match app.pet.as_mut() {
-            Some(p) => p,
-            None => return 0,
+        // 取当前帧 BGRA 缩略（从 render_buf）；无桌宠（未导入素材）时用默认圆形图标
+        let (sw, sh, src): (usize, usize, Vec<u8>) = match app.pet.as_mut() {
+            Some(p) => (
+                p.render_buf.len() / ((crate::clip::H + 30) * 4),
+                crate::clip::H + 30,
+                p.render_buf.clone(),
+            ),
+            None => (32, 32, default_icon_bgra()),
         };
-        // 取当前帧 BGRA 缩略（从 render_buf）
-        let (sw, sh) = (pet.render_buf.len() / ((crate::clip::H + 30) * 4), crate::clip::H + 30);
-        let thumb = make_thumb(&pet.render_buf, sw, sh, dw, dh);
+        let thumb = make_thumb(&src, sw, sh, dw, dh);
 
         let hdc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
         if hdc.is_null() {
@@ -179,6 +188,25 @@ mod win32_main {
             DeleteDC(hdc);
         }
         icon as isize
+    }
+
+    /// 无素材时的默认托盘图标（32×32 圆形，BGRA）。
+    fn default_icon_bgra() -> Vec<u8> {
+        let mut buf = vec![0u8; 32 * 32 * 4];
+        for y in 0..32 {
+            for x in 0..32 {
+                let dx = x as f64 - 15.5;
+                let dy = y as f64 - 15.5;
+                if dx * dx + dy * dy <= 14.0 * 14.0 {
+                    let i = (y * 32 + x) * 4;
+                    buf[i] = 0x7f;
+                    buf[i + 1] = 0x9c;
+                    buf[i + 2] = 0xff;
+                    buf[i + 3] = 255;
+                }
+            }
+        }
+        buf
     }
 
     /// 双线性近似缩略图（BGRA）。

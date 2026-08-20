@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 // 托盘菜单命令
+pub const TRAY_CONSOLE: usize = 1004;
 pub const TRAY_TOGGLE_VISIBLE: usize = 1001;
 pub const TRAY_AUTOSTART: usize = 1002;
 pub const TRAY_QUIT: usize = 1003;

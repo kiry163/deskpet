@@ -31,6 +31,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tiny_http = "0.12"
+zip = "2"
 
 [build-dependencies]
 embed-resource = "2"
@@ -45,6 +47,7 @@ objc2-foundation = { version = "0.3", features = [
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication", "NSWindow", "NSView", "NSMenu", "NSMenuItem", "NSStatusItem",
     "NSStatusBar", "NSImage", "NSScreen", "NSEvent", "NSGraphicsContext", "NSColor",
-    "NSGraphics", "NSResponder", "NSControl",
+    "NSGraphics", "NSResponder", "NSControl", "NSWorkspace", "NSBezierPath",
+    "NSStringDrawing", "objc2-core-foundation",
 ] }
 objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGImage"] }

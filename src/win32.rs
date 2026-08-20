@@ -53,6 +53,13 @@ unsafe extern "system" fn wnd_proc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+/// 预渲染的说话气泡位图（BGRA premultiplied）。
+pub struct BubbleBitmap {
+    pub buf: Vec<u8>,
+    pub w: usize,
+    pub h: usize,
+}
+
 pub struct PetWindow {
     pub hwnd: HWND,
     hdc: isize,
@@ -62,6 +69,8 @@ pub struct PetWindow {
     pub height: i32,
     bits: *mut u8,
     pub alpha: Vec<u8>,
+    /// 说话气泡（say API，present 时合成到顶部）。
+    pub bubble: Option<BubbleBitmap>,
 }
 
 pub const FRAME_TIMER: usize = 1;
@@ -129,6 +138,7 @@ impl PetWindow {
             height: 1,
             bits: std::ptr::null_mut(),
             alpha: Vec::new(),
+            bubble: None,
         };
         pet.resize(1, 1);
         Some(pet)
@@ -237,6 +247,10 @@ impl PetWindow {
         unsafe {
             let dst = std::slice::from_raw_parts_mut(self.bits, stride * dh);
             crate::gfx::scale_bgra(src, sw, sh, dst, dw, dh, stride, mirror);
+            // 说话气泡合成到窗口顶部中央（premultiplied alpha 混合）
+            if let Some(b) = &self.bubble {
+                composite_bubble(dst, dw, dh, b);
+            }
             for y in 0..dh {
                 let row = y * stride;
                 for x in 0..dw {
@@ -271,6 +285,15 @@ impl PetWindow {
         }
     }
 
+    /// 设置说话气泡（say API）：GDI 预渲染为位图，present 时合成。
+    pub fn set_bubble(&mut self, text: &str) {
+        self.bubble = render_bubble(text);
+    }
+
+    pub fn clear_bubble(&mut self) {
+        self.bubble = None;
+    }
+
     /// 命中测试：像素 alpha<128 穿透。
     pub fn hit_test_alpha(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
@@ -302,6 +325,145 @@ impl Drop for PetWindow {
     }
 }
 
+/// GDI 预渲染说话气泡：圆角白底 + 深色文字 → BGRA premultiplied 位图。
+/// 字体优先微软雅黑（中文），回退系统默认。
+fn render_bubble(text: &str) -> Option<BubbleBitmap> {
+    use windows_sys::Win32::Foundation::{RECT, SIZE};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
+        DrawTextW, GetStockObject, GetTextExtentPoint32W, RoundRect, SelectObject, SetBkMode,
+        SetTextColor, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
+        DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, TRANSPARENT,
+        WHITE_BRUSH,
+    };
+
+    let hdc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+    if hdc.is_null() {
+        return None;
+    }
+    // 字体：微软雅黑 16px（负值 = 字符高度）
+    let face: Vec<u16> = "Microsoft YaHei\0".encode_utf16().collect();
+    let font = unsafe {
+        CreateFontW(
+            -16, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0,
+            CLEARTYPE_QUALITY as u32, 0, face.as_ptr(),
+        )
+    };
+    if font.is_null() {
+        unsafe { DeleteDC(hdc) };
+        return None;
+    }
+    let old_font = unsafe { SelectObject(hdc, font as _) };
+
+    // 文本尺寸
+    let text_w: Vec<u16> = text.encode_utf16().collect();
+    let mut sz: SIZE = unsafe { std::mem::zeroed() };
+    unsafe { GetTextExtentPoint32W(hdc, text_w.as_ptr(), text_w.len() as i32, &mut sz) };
+    let pad_x = 14i32;
+    let pad_y = 7i32;
+    let bw = (sz.cx + pad_x * 2).max(40) as usize;
+    let bh = (sz.cy + pad_y * 2).max(24) as usize;
+
+    // 32bpp 顶向下 DIB（初始全透明）
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = bw as i32;
+    bmi.bmiHeader.biHeight = -(bh as i32);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bmp = unsafe {
+        CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0)
+    };
+    if bmp.is_null() {
+        unsafe {
+            DeleteObject(font as _);
+            DeleteDC(hdc);
+        }
+        return None;
+    }
+    let old_bmp = unsafe { SelectObject(hdc, bmp as _) };
+
+    // 圆角白底
+    let brush = unsafe { CreateSolidBrush(0x00FF_FFFF) };
+    if !brush.is_null() {
+        unsafe {
+            let old_brush = SelectObject(hdc, brush as _);
+            RoundRect(hdc, 0, 0, bw as i32, bh as i32, 16, 16);
+            SelectObject(hdc, old_brush as _);
+            DeleteObject(brush as _);
+        }
+    } else {
+        unsafe {
+            let old_brush = SelectObject(hdc, GetStockObject(WHITE_BRUSH) as _);
+            RoundRect(hdc, 0, 0, bw as i32, bh as i32, 16, 16);
+            SelectObject(hdc, old_brush as _);
+        }
+    }
+    // 深色文字（透明背景）
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, 0x001E_1E1E);
+        let mut rc = RECT {
+            left: pad_x,
+            top: 0,
+            right: bw as i32 - pad_x,
+            bottom: bh as i32,
+        };
+        DrawTextW(
+            hdc,
+            text_w.as_ptr(),
+            text_w.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        // 读回像素
+        let mut buf = vec![0u8; bw * bh * 4];
+        std::ptr::copy_nonoverlapping(bits as *const u8, buf.as_mut_ptr(), buf.len());
+        SelectObject(hdc, old_bmp as _);
+        SelectObject(hdc, old_font as _);
+        DeleteObject(bmp as _);
+        DeleteObject(font as _);
+        DeleteDC(hdc);
+        return Some(BubbleBitmap { buf, w: bw, h: bh });
+    }
+}
+
+/// 把气泡位图合成到窗口像素缓冲顶部中央（premultiplied alpha 混合）。
+fn composite_bubble(dst: &mut [u8], dw: usize, dh: usize, b: &BubbleBitmap) {
+    if b.w == 0 || b.h == 0 || b.w >= dw {
+        return;
+    }
+    let bx = ((dw - b.w) / 2).max(0);
+    let by = 4usize;
+    for y in 0..b.h {
+        let dy = by + y;
+        if dy >= dh {
+            break;
+        }
+        for x in 0..b.w {
+            let dx = bx + x;
+            if dx >= dw {
+                break;
+            }
+            let si = (y * b.w + x) * 4;
+            let sa = b.buf[si + 3];
+            if sa == 0 {
+                continue;
+            }
+            let di = (dy * dw + dx) * 4;
+            let inv = 255 - sa;
+            dst[di] = ((b.buf[si] as u32 * sa as u32 + dst[di] as u32 * inv as u32) / 255) as u8;
+            dst[di + 1] =
+                ((b.buf[si + 1] as u32 * sa as u32 + dst[di + 1] as u32 * inv as u32) / 255) as u8;
+            dst[di + 2] =
+                ((b.buf[si + 2] as u32 * sa as u32 + dst[di + 2] as u32 * inv as u32) / 255) as u8;
+            dst[di + 3] = 255;
+        }
+    }
+}
+
 /// 全局光标位置（物理像素）。
 pub fn cursor_pos() -> (i32, i32) {
     let mut p: POINT = unsafe { std::mem::zeroed() };
@@ -316,6 +478,23 @@ pub fn cursor_pos() -> (i32, i32) {
 /// 请求退出消息循环。
 pub fn post_quit() {
     unsafe { PostQuitMessage(0) };
+}
+
+/// 用系统默认浏览器打开 URL（打开控制台）。
+pub fn open_url(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let u: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            windows_sys::core::w!("open"),
+            u.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
 }
 
 /// 消息循环。

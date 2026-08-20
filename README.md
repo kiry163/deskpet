@@ -23,6 +23,10 @@
 - 拖拽：Windows `SetCapture` / macOS AppKit 按下期间隐式捕获 + 全局坐标跟手
 - 托盘右键菜单：回到右下角 / 窗口置顶 / 不移动 / 开机自启 / 大小（50% 72% 85% 100%）/ 显示隐藏 / 退出
   （桌宠身上不再弹右键菜单，全部集中到托盘）
+- **浏览器控制台**（托盘「打开控制台」→ `http://127.0.0.1:<port>/`，前端编译期内嵌）：
+  状态面板 + 指令面板（say 气泡 / play / move / 退出）、zip 素材导入、外观配置（热生效）
+- **zip 素材导入**：控制台导入素材包（校验 → 解压到素材根 → 热加载，不重启）；
+  发布物仅二进制，素材不随包分发（docs/需求规格.md §3）
 - 鼠标悬停桌宠 → 手型光标，提示可交互（点击回应 / 拖拽）——**仅 Windows**（macOS 因逐 tick
   穿透切换，窗口服务器不支持光标样式，悬停手型已放弃）
 - 开机自启：Windows `HKCU\...\Run`；macOS `~/Library/LaunchAgents/com.kiry.deskpet.plist`
@@ -38,11 +42,13 @@
 1. **libvpx**（推荐 vcpkg）：`vcpkg install libvpx:x64-windows`，构建时设
    `set VPX_LIB_DIR=C:\path\to\vcpkg\installed\x64-windows\lib`。
    或按上游方式编译出 `vendor_libvpx/x64/Release/vpxmd.lib`。
-2. **素材**：从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制 51 个 webm 到
+2. **素材**（开发期）：从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制 51 个 webm 到
    本仓库 `assets/videos/`。素材与软件分离：运行时从素材根目录加载
-   （解析顺序：配置 `assets_dir` > 环境变量 `DESKPET_ASSETS_DIR` > exe 旁 `assets/` >
-   当前目录 `assets/`）。
-3. `cargo build --release` → `target\release\deskpet.exe`（约 1.5MB，不含素材）。
+   （解析顺序：配置 `assets_dir` > 环境变量 `DESKPET_ASSETS_DIR` > 配置目录 `assets/` >
+   exe 旁 `assets/` > 当前目录 `assets/`）。
+   **运行时**：发布物不含素材，首次运行后经控制台导入素材 zip 包（见「控制台」）。
+3. **前端**（可选，缺失时控制台用内嵌占位页）：`cd web && npm install && npm run build`。
+4. `cargo build --release` → `target\release\deskpet.exe`（约 1.5MB，不含素材）。
 
 ### macOS
 
@@ -50,11 +56,17 @@
 
 1. **libvpx**：`brew install libvpx`（或 vcpkg；build.rs 自动探测
    `VPX_LIB_DIR` > `VCPKG_ROOT/installed/*-osx/lib` > `/opt/homebrew/lib` > `/usr/local/lib`）。
-2. **素材**：同 Windows——从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制到
+2. **素材**（开发期）：从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制到
    `assets/videos/`，或设 `DESKPET_ASSETS_DIR` 指向素材根目录。
-3. 在 Mac 上：`cargo build --release`，运行 `target/release/deskpet`。
+   **运行时**：发布物不含素材，首次运行后经控制台导入素材 zip 包（见「控制台」）。
+3. **前端**（可选，缺失时控制台用内嵌占位页）：`cd web && npm install && npm run build`，
+   产物编译期内嵌进二进制；开发期免重编译可用 `DESKPET_CONSOLE_DIR=web/dist`。
+4. 在 Mac 上：`cargo build --release`，运行 `target/release/deskpet`。
 
 > 跨平台类型检查（无需 Mac）：`DESKPET_ALLOW_NO_LIBVPX=1 cargo check --target aarch64-apple-darwin`
+
+> crates.io 不可达时（本机实测），cargo 命令需带 rsproxy 镜像参数：
+> `--config 'source.crates-io.replace-with="rsproxy-sparse"' --config 'source.rsproxy-sparse.registry="sparse+https://rsproxy.cn/index/"'`
 
 ### macOS 真机验证（2025 完成）
 
@@ -98,9 +110,25 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
 
 `rx/ry` 为工作区内归一化位置（0..1，相对于主屏工作区），`null` 表示右下角默认位。
 `autostart` 不持久化在配置中，以注册表/LaunchAgent 为准（避免与系统启动项管理漂移）。
-`assets_dir`（素材根目录，`null` = 自动解析：环境变量 `DESKPET_ASSETS_DIR` > exe 旁
-`assets/` > 当前目录 `assets/`）与 `character`（角色子目录名，`null` = 自动检测
-`assets/` 下第一个含 `videos/` 或 `manifest.json` 的子目录；兼容 `assets/` 本身即角色目录）。
+`assets_dir`（素材根目录，`null` = 自动解析：环境变量 `DESKPET_ASSETS_DIR` > 配置目录
+`assets/` > exe 旁 `assets/` > 当前目录 `assets/`）与 `character`（角色子目录名，
+`null` = 自动检测 `assets/` 下第一个含 `videos/` 或 `manifest.json` 的子目录；
+兼容 `assets/` 本身即角色目录）。配置也可在控制台「配置」页修改（热生效并落盘）。
+
+## 控制台
+
+托盘/状态栏菜单「打开控制台」→ 系统默认浏览器打开 `http://127.0.0.1:<port>/`
+（实际端口写 `<配置目录>/control.json`，默认 18686）。前端编译期内嵌在二进制里，
+`web/dist` 缺失时回退内嵌占位页（仍可导入素材）。
+
+- **状态**：当前动作/位置/朝向/缩放/可见性 + 指令面板（say 气泡 / play 动作 / move / 退出）
+- **导入**：拖拽上传素材 zip 包（zip 根 = `manifest.json` + `videos/`），校验 → 解压到
+  素材根 → 热加载（不重启），导入角色自动成为当前角色
+- **配置**：缩放 / 置顶 / 朝向 / 可见性 / 不移动，改动即时生效并写入 config.json
+
+对外 JSON API（Agent / 脚本直接调用）：`GET /api/state`、`GET|PATCH /api/config`、
+`POST /api/pet/{say,play,move,set_state}`、`POST /api/import`、`POST /api/quit`；
+响应统一 `{ok, data?, error?}`，详见 docs/需求规格.md §5。
 
 ## 与上游差异
 

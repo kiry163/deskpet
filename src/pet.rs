@@ -2,9 +2,9 @@
 //! 平台差异（窗口创建/事件来源/菜单渲染/光标）由 win32.rs / macos.rs 桥接层处理。
 #![allow(non_snake_case, dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::assets::RoleAssets;
 use crate::clip::{ClipDecoder, H, W};
@@ -19,6 +19,22 @@ pub const MID_ONTOP: usize = 191;
 pub const MID_NOMOVE: usize = 192;
 pub const MID_AUTOSTART: usize = 193;
 pub const MID_SCALE_BASE: usize = 200;
+
+/// 说话气泡（平台层绘制，不依赖素材）。
+pub struct Bubble {
+    pub text: String,
+    pub until: Instant,
+}
+
+/// 外部指令（HTTP API 下发），高优先级插入动画链状态机。
+pub enum PetCommand {
+    /// 播放指定动作（已解析的动作名）。
+    Play(String),
+    /// 移动到工作区归一化位置（0..1）。
+    MoveTo { x: f64, y: f64 },
+    /// 说话气泡。
+    Say { text: String, duration_ms: Option<u64> },
+}
 
 #[derive(Clone)]
 struct MovePlan {
@@ -41,6 +57,10 @@ pub struct Pet {
     pub render_buf: Vec<u8>,
     pub frame_accum_ms: u64,
     pub anim_ended_fired: bool,
+    /// 说话气泡（None = 无）。
+    pub bubble: Option<Bubble>,
+    /// 外部指令队列（HTTP API 下发，tick 内高优先级执行）。
+    cmd_queue: VecDeque<PetCommand>,
 
     press_global: Option<(i32, i32)>,
     grab_offset: Option<(i32, i32)>,
@@ -96,6 +116,8 @@ impl Pet {
             render_buf: vec![0u8; W * (H + 30) * 4],
             frame_accum_ms: 0,
             anim_ended_fired: false,
+            bubble: None,
+            cmd_queue: VecDeque::new(),
             press_global: None,
             grab_offset: None,
             dragging: false,
@@ -118,6 +140,88 @@ impl Pet {
         let w = (state::CANVAS_W * self.scale).round() as i32;
         let h = ((state::CANVAS_H + state::PAD) * self.scale).round() as i32;
         (w.max(1), h.max(1))
+    }
+
+    /// 热替换素材集（导入后 / 角色切换）：重建 clips/cats，重播待机动画，保留窗口与位置。
+    pub fn swap_role(&mut self, role: &Rc<RoleAssets>) {
+        let (clips, cats) = build_from_role(role);
+        self.clips = clips;
+        self.cats = cats;
+        self.cancel_move();
+        self.move_plan = None;
+        self.cur_anim = String::new();
+        self.anim_ended_fired = false;
+        let idle = self.cats.idle.clone().unwrap_or_default();
+        self.switch_anim(&idle);
+        log_info!("素材已热替换（{} 段动画）", self.clips.len());
+    }
+
+    // ---------------- 外部指令（HTTP API，docs/需求规格.md §4.3） ----------------
+
+    /// 入队外部指令（下个 tick 高优先级执行）。
+    pub fn enqueue(&mut self, cmd: PetCommand) {
+        self.cmd_queue.push_back(cmd);
+    }
+
+    fn exec_command(&mut self, cmd: PetCommand) {
+        match cmd {
+            PetCommand::Play(name) => {
+                if let Some(resolved) = self.resolve_action(&name) {
+                    log_info!("指令 play: {} -> {}", name, resolved);
+                    self.switch_anim(&resolved);
+                } else {
+                    log_warn!("指令 play: 未找到动作 {}", name);
+                }
+            }
+            PetCommand::MoveTo { x, y } => self.move_to_normalized(x, y),
+            PetCommand::Say { text, duration_ms } => {
+                let ms = duration_ms.unwrap_or(4000).max(500);
+                self.bubble = Some(Bubble {
+                    text,
+                    until: Instant::now() + Duration::from_millis(ms),
+                });
+            }
+        }
+    }
+
+    /// 动作名解析：精确名 → 语义名（idle/turn/move/act/click/drag）→ 子串最近匹配。
+    pub fn resolve_action(&self, query: &str) -> Option<String> {
+        let q = query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        if self.clips.contains_key(q) {
+            return Some(q.to_string());
+        }
+        let sem = match q.to_ascii_lowercase().as_str() {
+            "idle" => self.cats.idle.clone(),
+            "turn" => self.cats.turns.first().cloned(),
+            "move" | "moves" => self.cats.moves.first().cloned(),
+            "act" | "acts" => self.cats.acts.first().cloned(),
+            "click" | "clicks" => self.cats.clicks.first().cloned(),
+            "drag" => self.cats.drag.clone(),
+            _ => None,
+        };
+        if let Some(n) = sem {
+            return Some(n);
+        }
+        self.clips
+            .keys()
+            .find(|n| n.contains(q) || q.contains(n.as_str()))
+            .cloned()
+    }
+
+    /// 移动到工作区归一化位置（0..1，立即生效，不播放移动动画）。
+    pub fn move_to_normalized(&mut self, x: f64, y: f64) {
+        let (lx, ly, rx, ry) = self.avail_rect();
+        let (wx, wh) = self.window_size();
+        let tx = (lx as f64 + x.clamp(0.0, 1.0) * (rx - lx) as f64) as i32 - wx / 2;
+        let ty = (ly as f64 + y.clamp(0.0, 1.0) * (ry - ly) as f64) as i32 - wh / 2;
+        let tx = tx.clamp(lx, (rx - wx).max(lx));
+        let ty = ty.clamp(ly, (ry - wh).max(ly));
+        self.cancel_move();
+        self.win.move_to(tx, ty);
+        log_info!("指令 move: ({:.2}, {:.2}) -> ({}, {})", x, y, tx, ty);
     }
 
     pub fn switch_anim(&mut self, name: &str) {
@@ -376,6 +480,17 @@ impl Pet {
 
     /// 每 tick（10ms）驱动：帧推进 + 移动插值。
     pub fn on_tick(&mut self) {
+        // 外部指令（HTTP API）：高优先级，先于动画推进执行
+        while let Some(cmd) = self.cmd_queue.pop_front() {
+            self.exec_command(cmd);
+        }
+        // 气泡过期清理
+        if let Some(b) = &self.bubble {
+            if Instant::now() >= b.until {
+                self.bubble = None;
+            }
+        }
+
         let dt = self.last_tick.elapsed();
         self.last_tick = Instant::now();
         let dt_ms = dt.as_millis() as u64;

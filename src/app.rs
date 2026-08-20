@@ -2,7 +2,10 @@
 //! Windows 消息桥接（WindowCallback）在 #[cfg(windows)] 下实现；macOS 由 macos.rs 直接调用。
 #![allow(non_snake_case, dead_code)]
 
+use std::sync::mpsc;
+
 use crate::config::Config;
+use crate::control::{ApiOp, ApiRequest};
 use crate::pet::{self, Pet};
 
 pub const WM_TRAY: u32 = 0x0400 + 100; // win32 托盘回调消息（与 tray.rs 一致）
@@ -11,34 +14,42 @@ pub struct App {
     pub pet: Option<Pet>,
     pub cfg: Config,
     pub quitting: bool,
+    /// 无素材时保留的透明窗口（导入后交给 Pet::new）。
+    win: Option<crate::platform::PetWindow>,
+    /// HTTP 线程 → 主线程的 API 请求队列（平台 tick 内排空）。
+    api_rx: Option<mpsc::Receiver<ApiRequest>>,
+    /// 本地控制服务（HTTP：管理前端 + JSON API）。
+    pub console: Option<crate::control::ControlServer>,
 }
 
 impl App {
-    pub fn new() -> App {
+    pub fn new(api_rx: mpsc::Receiver<ApiRequest>) -> App {
         let cfg = Config::load();
-        let assets_dir = crate::assets::resolve_assets_dir(cfg.pet.assets_dir.as_deref());
-        let role = match crate::assets::load(&assets_dir, cfg.pet.character.as_deref()) {
-            Some(r) => std::rc::Rc::new(r),
-            // 素材缺失/解析全部失败
-            None => {
-                return App {
-                    pet: None,
-                    cfg,
-                    quitting: false,
-                };
-            }
-        };
+        let assets_dir = crate::assets::resolve_assets_dir(cfg.pet.assets_dir.as_deref(), &cfg.dir);
+        let role = crate::assets::load(&assets_dir, cfg.pet.character.as_deref()).map(std::rc::Rc::new);
+        // 窗口始终创建：无素材时也保留（Windows 托盘/定时器需要 hwnd），导入后交给 Pet。
+        let win = crate::platform::PetWindow::create(cfg.pet.always_on_top);
         let mut app = App {
             pet: None,
             cfg,
             quitting: false,
+            win: None,
+            api_rx: Some(api_rx),
+            console: None,
         };
-        if let Some(win) = crate::platform::PetWindow::create(app.cfg.pet.always_on_top) {
-            let mut pet = Pet::new(win, &role, &app.cfg.pet);
-            pet.restore_position(&app.cfg.pet);
-            app.pet = Some(pet);
-        } else {
-            log_error!("透明窗口创建失败");
+        match (win, role) {
+            (Some(win), Some(role)) => {
+                let mut pet = Pet::new(win, &role, &app.cfg.pet);
+                pet.restore_position(&app.cfg.pet);
+                app.pet = Some(pet);
+            }
+            (Some(win), None) => {
+                // 无素材（或解析失败）：应用照常运行，窗口保留等待控制台导入
+                log_warn!("素材加载失败或无素材，等待控制台导入（桌宠未创建）");
+                win.start_frame_timer(10);
+                app.win = Some(win);
+            }
+            (None, _) => log_error!("透明窗口创建失败"),
         }
         app
     }
@@ -54,6 +65,9 @@ impl App {
     pub fn quit_all(&mut self) {
         self.quitting = true;
         self.save_position();
+        if let Some(c) = &self.console {
+            c.stop();
+        }
         crate::platform::post_quit();
     }
 
@@ -65,13 +79,17 @@ impl App {
 
     #[cfg(windows)]
     pub fn primary_hwnd(&self) -> windows_sys::Win32::Foundation::HWND {
-        self.pet.as_ref().map(|p| p.win.hwnd).unwrap_or(std::ptr::null_mut())
+        if let Some(p) = &self.pet {
+            return p.win.hwnd;
+        }
+        self.win.as_ref().map(|w| w.hwnd).unwrap_or(std::ptr::null_mut())
     }
 
     /// 处理托盘菜单命令。
     pub fn handle_tray_command(&mut self, cmd: usize) {
         log_debug!("执行托盘命令: {}", cmd);
         match cmd {
+            crate::tray::TRAY_CONSOLE => self.open_console(),
             crate::tray::TRAY_TOGGLE_VISIBLE => self.toggle_visible(),
             crate::tray::TRAY_AUTOSTART => {
                 let on = !crate::autostart::is_enabled();
@@ -79,6 +97,17 @@ impl App {
             }
             crate::tray::TRAY_QUIT => self.quit_all(),
             _ => {}
+        }
+    }
+
+    /// 打开系统默认浏览器访问控制台。
+    fn open_console(&self) {
+        match &self.console {
+            Some(c) => {
+                log_info!("打开控制台: {}", c.url);
+                crate::platform::open_url(&c.url);
+            }
+            None => log_warn!("控制服务未启动，无法打开控制台"),
         }
     }
 
@@ -105,9 +134,224 @@ impl App {
     }
 
     pub fn on_pet_tick(&mut self) {
+        self.drain_api();
         if let Some(pet) = &mut self.pet {
             pet.on_tick();
         }
+    }
+
+    // ---------------- 本地 HTTP 控制服务（API） ----------------
+
+    /// 排空 HTTP 线程发来的 API 请求（平台 tick 内调用；无素材时也须 tick）。
+    pub fn drain_api(&mut self) {
+        // 取出 receiver 再处理，避免 self 同时被不可变（rx）与可变（handle_api）借用
+        let rx = match self.api_rx.take() {
+            Some(r) => r,
+            None => return,
+        };
+        while let Ok(req) = rx.try_recv() {
+            if matches!(req.op, ApiOp::Quit) {
+                // 退出顺序：先回复 → 给 HTTP 线程冲刷响应的时间 → 最后触发退出，
+                // 避免 terminate/post_quit 同步退出导致客户端收到空回复
+                let _ = req.reply.send(serde_json::json!({"ok": true, "data": {"msg": "bye"}}));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                self.quit_all();
+                continue;
+            }
+            let resp = self.handle_api(req.op);
+            let _ = req.reply.send(resp);
+        }
+        self.api_rx = Some(rx);
+    }
+
+    fn handle_api(&mut self, op: ApiOp) -> serde_json::Value {
+        use serde_json::json;
+        match op {
+            ApiOp::State => self.api_state(),
+            ApiOp::GetConfig => self.api_get_config(),
+            ApiOp::PatchConfig(v) => self.api_patch_config(v),
+            ApiOp::Play(action) => self.api_play(&action),
+            ApiOp::MoveTo { x, y } => match &mut self.pet {
+                Some(p) => {
+                    p.enqueue(crate::pet::PetCommand::MoveTo { x, y });
+                    json!({"ok": true, "data": {"move": {"x": x, "y": y}}})
+                }
+                None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
+            },
+            ApiOp::SetState(v) => self.api_set_state(v),
+            ApiOp::Say { text, duration_ms } => match &mut self.pet {
+                Some(p) => {
+                    p.enqueue(crate::pet::PetCommand::Say { text: text.clone(), duration_ms });
+                    json!({"ok": true, "data": {"say": text}})
+                }
+                None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
+            },
+            ApiOp::ApplyImport { id } => match self.apply_import(&id) {
+                Ok(()) => json!({"ok": true, "data": {"character": id}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            // Quit 由 drain_api 特判（先回复再退出），此处兜底
+            ApiOp::Quit => json!({"ok": true, "data": {"msg": "bye"}}),
+        }
+    }
+
+    /// 播放动作：解析（精确/语义/模糊）后入队，下个 tick 高优先级执行。
+    fn api_play(&mut self, action: &str) -> serde_json::Value {
+        use serde_json::json;
+        match &mut self.pet {
+            Some(p) => match p.resolve_action(action) {
+                Some(name) => {
+                    p.enqueue(crate::pet::PetCommand::Play(name.clone()));
+                    json!({"ok": true, "data": {"played": name}})
+                }
+                None => json!({"ok": false, "error": format!("未找到动作: {}", action)}),
+            },
+            None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
+        }
+    }
+
+    /// 运行时状态设置（不落盘，区别于 PATCH /api/config）。
+    fn api_set_state(&mut self, patch: serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let o = match patch.as_object() {
+            Some(o) => o,
+            None => return json!({"ok": false, "error": "body must be object"}),
+        };
+        let Some(pet) = &mut self.pet else {
+            return json!({"ok": false, "error": "桌宠未创建（无素材）"});
+        };
+        let mut applied: Vec<&str> = Vec::new();
+        if let Some(v) = o.get("scale").and_then(|x| x.as_f64()) {
+            pet.change_scale(v);
+            applied.push("scale");
+        }
+        if let Some(v) = o.get("always_on_top").and_then(|x| x.as_bool()) {
+            pet.set_topmost(v);
+            applied.push("always_on_top");
+        }
+        if let Some(v) = o.get("no_move").and_then(|x| x.as_bool()) {
+            pet.set_no_move(v);
+            applied.push("no_move");
+        }
+        if let Some(v) = o.get("facing_right").and_then(|x| x.as_bool()) {
+            pet.facing_right = v;
+            applied.push("facing_right");
+        }
+        if let Some(v) = o.get("visible").and_then(|x| x.as_bool()) {
+            if v {
+                pet.win.show();
+                pet.visible = true;
+            } else {
+                pet.win.hide();
+                pet.visible = false;
+            }
+            applied.push("visible");
+        }
+        json!({"ok": true, "data": {"applied": applied}})
+    }
+
+    /// 应用导入结果：设置当前角色 → 落盘 → 热加载素材（无桌宠则用保留窗口创建）。
+    fn apply_import(&mut self, id: &str) -> Result<(), String> {
+        self.cfg.pet.character = Some(id.to_string());
+        self.cfg.save();
+        self.reload_assets()
+    }
+
+    /// 重新加载素材（导入后 / 角色切换）：pet 存在则热替换，否则用保留窗口创建。
+    pub fn reload_assets(&mut self) -> Result<(), String> {
+        let assets_dir =
+            crate::assets::resolve_assets_dir(self.cfg.pet.assets_dir.as_deref(), &self.cfg.dir);
+        let role = crate::assets::load(&assets_dir, self.cfg.pet.character.as_deref())
+            .map(std::rc::Rc::new)
+            .ok_or_else(|| format!("素材加载失败（{} 下无有效角色）", assets_dir.display()))?;
+        match &mut self.pet {
+            Some(pet) => pet.swap_role(&role),
+            None => {
+                let win = self.win.take().ok_or_else(|| "无可用窗口".to_string())?;
+                let mut pet = Pet::new(win, &role, &self.cfg.pet);
+                pet.restore_position(&self.cfg.pet);
+                self.pet = Some(pet);
+            }
+        }
+        Ok(())
+    }
+
+    fn api_state(&self) -> serde_json::Value {
+        use serde_json::json;
+        let Some(pet) = &self.pet else {
+            return json!({"ok": true, "data": {"pet": null}});
+        };
+        // get_rect 返回 (left, top, right, bottom)
+        let (l, t, r, b) = pet.win.get_rect();
+        json!({
+            "ok": true,
+            "data": {
+                "pet": {
+                    "anim": pet.cur_anim,
+                    "x": l, "y": t, "w": r - l, "h": b - t,
+                    "facing_right": pet.facing_right,
+                    "scale": pet.scale,
+                    "visible": pet.visible,
+                    "no_move": pet.no_move,
+                    "topmost": pet.win_topmost,
+                }
+            }
+        })
+    }
+
+    fn api_get_config(&self) -> serde_json::Value {
+        use serde_json::json;
+        let v = serde_json::to_value(&self.cfg.pet).unwrap_or(serde_json::Value::Null);
+        json!({"ok": true, "data": v})
+    }
+
+    /// PATCH /api/config：合并可写字段 → 生效 → 落盘。未知字段忽略。
+    fn api_patch_config(&mut self, patch: serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let o = match patch.as_object() {
+            Some(o) => o,
+            None => return json!({"ok": false, "error": "body must be object"}),
+        };
+        let mut applied: Vec<&str> = Vec::new();
+        if let Some(v) = o.get("scale").and_then(|x| x.as_f64()) {
+            self.cfg.pet.scale = v;
+            if let Some(p) = &mut self.pet {
+                p.change_scale(v);
+            }
+            applied.push("scale");
+        }
+        if let Some(v) = o.get("always_on_top").and_then(|x| x.as_bool()) {
+            self.cfg.pet.always_on_top = v;
+            if let Some(p) = &mut self.pet {
+                p.set_topmost(v);
+            }
+            applied.push("always_on_top");
+        }
+        if let Some(v) = o.get("no_move").and_then(|x| x.as_bool()) {
+            self.cfg.pet.no_move = v;
+            if let Some(p) = &mut self.pet {
+                p.set_no_move(v);
+            }
+            applied.push("no_move");
+        }
+        if let Some(v) = o.get("facing_right").and_then(|x| x.as_bool()) {
+            self.cfg.pet.facing_right = v; // 下一帧渲染即生效（每帧读取）
+            applied.push("facing_right");
+        }
+        if let Some(v) = o.get("visible").and_then(|x| x.as_bool()) {
+            if let Some(p) = &mut self.pet {
+                if v {
+                    p.win.show();
+                    p.visible = true;
+                } else {
+                    p.win.hide();
+                    p.visible = false;
+                }
+            }
+            applied.push("visible");
+        }
+        self.cfg.save();
+        json!({"ok": true, "data": {"applied": applied}})
     }
 
     /// 处理宠物右键菜单命令（自启全局命令 + 宠物自身命令）。
@@ -220,6 +464,7 @@ mod win32_bridge {
                 .map(|p| p.context_menu_items())
                 .unwrap_or_default();
             items.push(MenuEntry::separator());
+            items.push(MenuEntry::item(crate::tray::TRAY_CONSOLE, "打开控制台"));
             items.push(MenuEntry::item(crate::tray::TRAY_TOGGLE_VISIBLE, "显示/隐藏"));
             items.push(MenuEntry::item(crate::tray::TRAY_QUIT, "退出"));
             let (sx, sy) = crate::win32::cursor_pos();

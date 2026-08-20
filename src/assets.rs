@@ -30,8 +30,10 @@ pub struct RoleAssets {
     pub names: Vec<String>,
 }
 
-/// 素材根目录解析：配置 > 环境变量 DESKPET_ASSETS_DIR > exe 旁 assets/ > 当前目录 assets/。
-pub fn resolve_assets_dir(configured: Option<&str>) -> PathBuf {
+/// 素材根目录解析：配置 > 环境变量 DESKPET_ASSETS_DIR > 配置目录 assets/（若存在）>
+/// exe 旁 assets/ > 当前目录 assets/。默认素材根 = 配置目录 assets/（M1 决策，
+/// 发布物仅二进制后 exe 旁可能只读；首次导入后该目录即存在）。
+pub fn resolve_assets_dir(configured: Option<&str>, config_dir: &Path) -> PathBuf {
     if let Some(d) = configured {
         if !d.trim().is_empty() {
             return PathBuf::from(d);
@@ -41,6 +43,10 @@ pub fn resolve_assets_dir(configured: Option<&str>) -> PathBuf {
         if !d.trim().is_empty() {
             return PathBuf::from(d);
         }
+    }
+    let cfg_assets = config_dir.join("assets");
+    if cfg_assets.is_dir() {
+        return cfg_assets;
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = exe.parent() {

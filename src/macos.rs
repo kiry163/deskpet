@@ -142,6 +142,10 @@ define_class!(
                     NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bounds.size.width, bounds.size.height)),
                     img,
                 );
+                // 说话气泡（say API）
+                if let Some(bubble) = &pet.bubble {
+                    draw_bubble(&*ctx as *const CGContext as *mut CGContext, bounds, bubble);
+                }
             }
         }
     }
@@ -166,6 +170,51 @@ impl PetView {
         let h = self.bounds().size.height;
         (vp.x as i32, (h - vp.y) as i32)
     }
+}
+
+/// 说话气泡：圆角矩形 + 文本（say API，平台层绘制，不依赖素材）。
+/// 视图未翻转（左下原点），气泡放在视图顶部中央。
+fn draw_bubble(ctx: *mut CGContext, bounds: NSRect, bubble: &crate::pet::Bubble) {
+    use objc2_app_kit::{
+        NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSBezierPath,
+    };
+    let text = NSString::from_str(&bubble.text);
+    // 单行尺寸（默认属性：系统字体 12pt 黑色文字）
+    let single = unsafe { text.sizeWithAttributes(None) };
+    let pad_x = 14.0;
+    let pad_y = 7.0;
+    let max_w = (bounds.size.width - 12.0).max(48.0);
+    let bw = (single.width + pad_x * 2.0).clamp(48.0, max_w);
+    // 按实际宽度重新测量（自动换行后的高度），避免长文本被裁剪
+    let text_w = (bw - pad_x * 2.0).max(1.0);
+    let wrapped = unsafe {
+        text.boundingRectWithSize_options_attributes_context(
+            NSSize::new(text_w, f64::INFINITY),
+            NSStringDrawingOptions::UsesLineFragmentOrigin,
+            None,
+            None,
+        )
+    };
+    let bh = (wrapped.size.height + pad_y * 2.0 + 2.0).max(26.0);
+    let bx = (bounds.size.width - bw) / 2.0;
+    let by = (bounds.size.height - bh - 6.0).max(2.0); // 顶部留 6pt
+    let rect = NSRect::new(NSPoint::new(bx, by), NSSize::new(bw, bh));
+
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 8.0, 8.0);
+    unsafe {
+        // 背景白底 + 灰色描边 + 深色文字
+        NSColor::whiteColor().setFill();
+        path.fill();
+        NSColor::grayColor().setStroke();
+        path.setLineWidth(1.0);
+        path.stroke();
+        let tr = NSRect::new(
+            NSPoint::new(bx + pad_x, by + pad_y),
+            NSSize::new((bw - pad_x * 2.0).max(1.0), (bh - pad_y * 2.0).max(1.0)),
+        );
+        text.drawInRect_withAttributes(tr, None);
+    }
+    let _ = ctx; // 文本/图形经 AppKit 绘制到当前上下文，无需直接使用 ctx
 }
 
 // ---------------- 菜单处理器（status menu 的 target） ----------------
@@ -493,11 +542,30 @@ pub fn post_quit() {
     NSApplication::sharedApplication(mtm).terminate(None);
 }
 
+/// 用系统默认浏览器打开 URL（打开控制台）。
+pub fn open_url(url: &str) {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::NSURL;
+    let s = NSString::from_str(url);
+    let Some(nsurl) = NSURL::URLWithString(&s) else {
+        log_warn!("URL 无效: {}", url);
+        return;
+    };
+    let ws = NSWorkspace::sharedWorkspace();
+    if !ws.openURL(&nsurl) {
+        log_warn!("打开 URL 失败: {}", url);
+    }
+}
+
 // ---------------- 状态栏 / 定时器 / 主循环 ----------------
 
 /// 从当前渲染帧生成状态栏图标（CGImage 独立副本 → NSImage）。
 fn make_status_image(app: &mut App) -> Option<Retained<NSImage>> {
-    let pet = app.pet.as_mut()?;
+    let pet = match app.pet.as_mut() {
+        Some(p) => p,
+        // 无素材（未导入）时用默认圆形图标，保证状态栏可点
+        None => return default_status_image(),
+    };
     let img = pet.win.make_image();
     if img.is_null() {
         return None;
@@ -514,6 +582,44 @@ fn make_status_image(app: &mut App) -> Option<Retained<NSImage>> {
     Some(nsimg)
 }
 
+/// 无素材时的默认状态栏图标（32×18 椭圆，BGRA premultiplied）。
+fn default_status_image() -> Option<Retained<NSImage>> {
+    let mtm = MainThreadMarker::new()?;
+    let (w, h) = (32usize, 18usize);
+    let mut buf = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f64 - w as f64 / 2.0;
+            let dy = y as f64 - h as f64 / 2.0;
+            if dx * dx / (13.5 * 13.5) + dy * dy / (7.0 * 7.0) <= 1.0 {
+                let i = (y * w + x) * 4;
+                buf[i] = 0x7f;
+                buf[i + 1] = 0x9c;
+                buf[i + 2] = 0xff;
+                buf[i + 3] = 255;
+            }
+        }
+    }
+    unsafe {
+        let cs = CGColorSpaceCreateDeviceRGB();
+        if cs.is_null() {
+            return None;
+        }
+        let ctx = CGBitmapContextCreate(buf.as_mut_ptr() as *mut c_void, w, h, 8, w * 4, cs, BITMAP_INFO);
+        CGColorSpaceRelease(cs);
+        if ctx.is_null() {
+            return None;
+        }
+        let img = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+        if img.is_null() {
+            return None;
+        }
+        let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*img, NSSize::new(32.0, 18.0));
+        Some(nsimg)
+    }
+}
+
 fn setup_status_item(mtm: MainThreadMarker, app: &mut App) {
     let bar = NSStatusBar::systemStatusBar();
     let item = bar.statusItemWithLength(-1.0); // NSStatusItemVariableLength
@@ -523,13 +629,14 @@ fn setup_status_item(mtm: MainThreadMarker, app: &mut App) {
         }
         btn.setToolTip(Some(ns_string!("deskpet 桌宠")));
     }
-    // 完整菜单：桌宠菜单（角落/置顶/不移动/自启/大小）+ 显示隐藏/退出（与 win32 托盘右键一致）
+    // 完整菜单：桌宠菜单（角落/置顶/不移动/自启/大小）+ 打开控制台/显示隐藏/退出（与 win32 托盘右键一致）
     let mut items = app
         .pet
         .as_ref()
         .map(|p| p.context_menu_items())
         .unwrap_or_default();
     items.push(MenuEntry::separator());
+    items.push(MenuEntry::item(crate::tray::TRAY_CONSOLE, "打开控制台"));
     items.push(MenuEntry::item(crate::tray::TRAY_TOGGLE_VISIBLE, "显示/隐藏"));
     items.push(MenuEntry::item(crate::tray::TRAY_QUIT, "退出"));
     let menu = build_ns_menu(&items);
