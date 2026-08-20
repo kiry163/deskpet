@@ -1,8 +1,0 @@
-[09:06:39.445] [INFO ] deskpet 0.1.0 启动 (os=windows, console=false)
-[09:06:39.476] [DEBUG] 读取配置: C:\Users\28269\AppData\Roaming\deskpet\config.json
-[09:06:39.501] [DEBUG] 加载内置素材（51 段动画）
-[09:06:39.556] [INFO ] 素材加载完成: 51 段动画
-[09:06:39.581] [INFO ] 动画分类: idle=Some("待机呼吸休闲") turn=Some("东张西望") moves=3 clicks=3 drag=Some("被鼠标拖拽悬空反馈") acts=42
-[09:06:39.601] [DEBUG] 切换动画:  -> 待机呼吸休闲
-[09:06:39.643] [DEBUG] 主屏工作区: (0, 0, 1920, 1032)
-[09:06:39.665] [INFO ] 桌宠窗口已创建，进入消息循环
