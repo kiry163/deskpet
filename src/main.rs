@@ -40,7 +40,7 @@ fn main() {
     let mut app = app::App::new();
     if app.pet.is_none() {
         log_error!("桌宠初始化失败（素材加载或窗口创建失败），退出");
-        return;
+        std::process::exit(1);
     }
 
     #[cfg(windows)]

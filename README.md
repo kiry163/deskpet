@@ -38,8 +38,10 @@
    `set VPX_LIB_DIR=C:\path\to\vcpkg\installed\x64-windows\lib`。
    或按上游方式编译出 `vendor_libvpx/x64/Release/vpxmd.lib`。
 2. **素材**：从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制 51 个 webm 到
-   本仓库 `assets/videos/`（或设 `DESKPET_VIDEOS_DIR` 指向素材目录）。
-3. `cargo build --release` → `target\release\deskpet.exe`（约 36MB 单文件）。
+   本仓库 `assets/videos/`。素材与软件分离：运行时从素材根目录加载
+   （解析顺序：配置 `assets_dir` > 环境变量 `DESKPET_ASSETS_DIR` > exe 旁 `assets/` >
+   当前目录 `assets/`）。
+3. `cargo build --release` → `target\release\deskpet.exe`（约 1.5MB，不含素材）。
 
 ### macOS
 
@@ -47,8 +49,8 @@
 
 1. **libvpx**：`brew install libvpx`（或 vcpkg；build.rs 自动探测
    `VPX_LIB_DIR` > `VCPKG_ROOT/installed/*-osx/lib` > `/opt/homebrew/lib` > `/usr/local/lib`）。
-2. **素材**：同 Windows——从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制，或设
-   `DESKPET_VIDEOS_DIR` 指向素材目录。
+2. **素材**：同 Windows——从上游 `ianlike-ui/dsh-pet-standalone` 的 `assets/videos/` 复制到
+   `assets/videos/`，或设 `DESKPET_ASSETS_DIR` 指向素材根目录。
 3. 在 Mac 上：`cargo build --release`，运行 `target/release/deskpet`。
 
 > 跨平台类型检查（无需 Mac）：`DESKPET_ALLOW_NO_LIBVPX=1 cargo check --target aarch64-apple-darwin`
@@ -89,20 +91,27 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
   "facing_right": true,
   "scale": 0.5,
   "always_on_top": true,
-  "no_move": false
+  "no_move": false,
+  "assets_dir": null,
+  "character": null
 }
 ```
 
 `rx/ry` 为工作区内归一化位置（0..1，相对于主屏工作区），`null` 表示右下角默认位。
 `autostart` 不持久化在配置中，以注册表/LaunchAgent 为准（避免与系统启动项管理漂移）。
+`assets_dir`（素材根目录，`null` = 自动解析：环境变量 `DESKPET_ASSETS_DIR` > exe 旁
+`assets/` > 当前目录 `assets/`）与 `character`（角色子目录名，`null` = 自动检测
+`assets/` 下第一个含 `videos/` 或 `manifest.json` 的子目录；兼容 `assets/` 本身即角色目录）。
 
 ## 与上游差异
 
 - 裁剪：多角色（外部形象目录）、多桌宠（生成/删除）、右键"播放任意动画"子菜单
 - 配置：改为单宠物结构 + 从旧版 Tauri 应用迁移；位置用归一化 `rx/ry`
 - 自启注册表值名：`deskpet`（上游为 `dsh-pet-standalone`）
-- 构建：libvpx 链接改为 build.rs 自动探测（`vpx.lib`/`vpxmd.lib`，vcpkg 优先），
-  素材目录支持仓库根共享 + 环境变量覆盖
+- 构建：libvpx 链接改为 build.rs 自动探测（`vpx.lib`/`vpxmd.lib`，vcpkg 优先）
+- 素材：与软件分离（exe 不内嵌素材，~1.5MB），运行时从目录加载
+  （`assets_dir`/`character` 配置 + manifest.json 分类 + 子目录/关键词兜底）；
+  支持自定义素材，见 docs/需求规格.md
 - 架构：平台中立核心（`pet.rs`/`state.rs`/`clip.rs`/`webm.rs`）+ 平台后端
   （`win32.rs` / `macos.rs`）；菜单为数据驱动（`menu.rs`）
 - **macOS 后端为全新编写**（上游无原生 macOS 实现；参考行为：动画链/交互与 Win32 版一致）

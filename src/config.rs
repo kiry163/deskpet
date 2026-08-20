@@ -32,6 +32,10 @@ pub struct PetConfig {
     pub scale: f64,
     pub always_on_top: bool,
     pub no_move: bool,
+    /// 素材根目录；None = 自动解析（exe 旁 assets/ 或当前目录 assets/）。
+    pub assets_dir: Option<String>,
+    /// 角色子目录名；None = 自动检测。
+    pub character: Option<String>,
 }
 
 impl Default for PetConfig {
@@ -43,6 +47,8 @@ impl Default for PetConfig {
             scale: 0.72,
             always_on_top: true,
             no_move: false,
+            assets_dir: None,
+            character: None,
         }
     }
 }

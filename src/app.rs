@@ -16,9 +16,10 @@ pub struct App {
 impl App {
     pub fn new() -> App {
         let cfg = Config::load();
-        let role = match crate::assets::load_builtin() {
+        let assets_dir = crate::assets::resolve_assets_dir(cfg.pet.assets_dir.as_deref());
+        let role = match crate::assets::load(&assets_dir, cfg.pet.character.as_deref()) {
             Some(r) => std::rc::Rc::new(r),
-            // 极端情况：素材解析全部失败
+            // 素材缺失/解析全部失败
             None => {
                 return App {
                     pet: None,
