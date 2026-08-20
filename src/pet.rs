@@ -124,7 +124,7 @@ impl Pet {
         if self.cur_anim == name {
             return;
         }
-        log_debug!("切换动画: {} -> {}", self.cur_anim, name);
+        log_info!("动画: {} -> {}", self.cur_anim, name);
         self.cancel_move();
         self.cur_anim = name.to_string();
         if let Some(clip) = self.clips.get_mut(&self.cur_anim) {
@@ -211,6 +211,7 @@ impl Pet {
             duration_ms,
         });
         self.move_accum_ms = 0;
+        log_info!("开始移动: {} -> x={}", move_name, (target_cx - half_w).round() as i32);
         true
     }
 
@@ -266,6 +267,7 @@ impl Pet {
         if (s - self.scale).abs() < 1e-6 {
             return;
         }
+        log_info!("缩放: {} -> {}", self.scale, s);
         let old_bottom = self.win.get_rect().3;
         self.scale = s;
         let (wx, wh) = self.window_size();
@@ -290,9 +292,11 @@ impl Pet {
         if self.visible {
             self.win.hide();
             self.visible = false;
+            log_info!("已隐藏");
         } else {
             self.win.show();
             self.visible = true;
+            log_info!("已显示");
         }
     }
 
@@ -327,6 +331,7 @@ impl Pet {
                 return;
             }
             self.dragging = true;
+            log_info!("开始拖拽");
             self.switch_anim(&self.cats.drag.clone().unwrap_or_default());
         }
         if let Some(off) = self.grab_offset {
@@ -340,6 +345,7 @@ impl Pet {
         let (sx, sy) = cursor_pos();
         if was_dragging {
             self.just_dragged = true;
+            log_info!("拖拽结束，位置 ({}, {})", sx, sy);
             if let Some(off) = self.grab_offset {
                 self.win.move_to(sx - off.0, sy - off.1);
             }
@@ -364,6 +370,7 @@ impl Pet {
         self.cancel_move();
         let c = self.cats.clicks.clone();
         let pick = state::pick(&c, None);
+        log_info!("点击回应: {}", pick);
         self.switch_anim(&pick);
     }
 
