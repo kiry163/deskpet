@@ -576,13 +576,16 @@ fn make_status_image(app: &mut App) -> Option<Retained<NSImage>> {
     }
     let copy = unsafe { CGImageCreateCopy(img) };
     if copy.is_null() {
+        // img 的 +1 也要释放
+        unsafe { CGImageRelease(img) };
         return None;
     }
     let mtm = MainThreadMarker::new()?;
-    // NSImage 持有传入的 CGImage（会 retain）；释放我们自己的 +1 引用
+    // NSImage 持有传入的 CGImage（会 retain）；释放我们自己创建的 +1 引用
     let nsimg = unsafe {
         let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*copy, NSSize::new(32.0, 18.0));
         CGImageRelease(copy);
+        CGImageRelease(img);
         nsimg
     };
     Some(nsimg)
