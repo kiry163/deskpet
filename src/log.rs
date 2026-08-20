@@ -7,7 +7,9 @@
 //! - 级别过滤：环境变量 `DESKPET_LOG`（off|error|warn|info|debug，默认 info）。
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -56,6 +58,8 @@ pub fn init(attach_console: bool) {
             }
         }
     }
+    #[cfg(not(windows))]
+    let _ = attach_console;
 }
 
 /// 当前级别是否启用。
