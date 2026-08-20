@@ -133,6 +133,7 @@ define_class!(
                     return;
                 }
                 let Some(ctx) = NSGraphicsContext::currentContext() else {
+                    CGImageRelease(img);
                     return;
                 };
                 let ctx = ctx.CGContext();
@@ -142,6 +143,9 @@ define_class!(
                     NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bounds.size.width, bounds.size.height)),
                     img,
                 );
+                // make_image 返回 +1 引用（CGBitmapContextCreateImage），必须配对释放，
+                // 否则每帧泄漏一个 CGImage → 内存线性增长
+                CGImageRelease(img);
                 // 说话气泡（say API）
                 if let Some(bubble) = &pet.bubble {
                     draw_bubble(&*ctx as *const CGContext as *mut CGContext, bounds, bubble);
@@ -575,9 +579,11 @@ fn make_status_image(app: &mut App) -> Option<Retained<NSImage>> {
         return None;
     }
     let mtm = MainThreadMarker::new()?;
-    // NSImage 持有传入的 CGImage；副本体积可忽略，不再显式释放
+    // NSImage 持有传入的 CGImage（会 retain）；释放我们自己的 +1 引用
     let nsimg = unsafe {
-        NSImage::initWithCGImage_size(mtm.alloc(), &*copy, NSSize::new(32.0, 18.0))
+        let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*copy, NSSize::new(32.0, 18.0));
+        CGImageRelease(copy);
+        nsimg
     };
     Some(nsimg)
 }
@@ -615,7 +621,9 @@ fn default_status_image() -> Option<Retained<NSImage>> {
         if img.is_null() {
             return None;
         }
+        // NSImage 会 retain img；释放我们自己的 +1 引用
         let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*img, NSSize::new(32.0, 18.0));
+        CGImageRelease(img);
         Some(nsimg)
     }
 }
