@@ -54,7 +54,9 @@ unsafe extern "C-unwind" {
 }
 
 /// kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst → 内存字节序 BGRA premultiplied（与 win32 渲染缓冲一致）。
-const BITMAP_INFO: u32 = (1 << 12) | 2;
+/// 注意：kCGBitmapByteOrder32Little = (2 << 12)，写成 (1 << 12) 会变成 16Little，
+/// 与 8 bit/component 组合非法，CGBitmapContextCreate 返回 NULL（真机渲染全透明）。
+const BITMAP_INFO: u32 = (2 << 12) | 2;
 
 /// 托盘菜单命令区间起点（>= 该值走 handle_tray_command，否则走 handle_command）。
 const TRAY_CMD_BASE: isize = 1001;
@@ -130,7 +132,9 @@ define_class!(
                 if img.is_null() {
                     return;
                 }
-                let Some(ctx) = NSGraphicsContext::currentContext() else { return };
+                let Some(ctx) = NSGraphicsContext::currentContext() else {
+                    return;
+                };
                 let ctx = ctx.CGContext();
                 let bounds = self.bounds();
                 CGContextDrawImage(

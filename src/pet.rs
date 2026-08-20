@@ -467,10 +467,10 @@ impl Pet {
         ];
         let mut scales = Vec::new();
         for (i, s) in state::SCALE_STEPS.iter().enumerate() {
-            let px = (state::CANVAS_W * s).round() as i32;
+            let pct = (s * 100.0).round() as i32;
             scales.push(MenuEntry::check(
                 MID_SCALE_BASE + i,
-                &format!("{}px", px),
+                &format!("{}%", pct),
                 (self.scale - s).abs() < 0.02,
             ));
         }

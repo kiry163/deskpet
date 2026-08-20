@@ -91,7 +91,11 @@ fn link_libvpx_macos() {
         }
         if dir.join("libvpx.a").is_file() {
             println!("cargo:rustc-link-search=native={}", dir.display());
-            println!("cargo:rustc-link-lib=static=vpx");
+            // macOS 的 ld 在同目录同时存在 libvpx.a / libvpx.dylib 时，`-l vpx`
+            // 会优先选择 dylib（rustc 的 static=vpx 不强制归档），导致产物动态
+            // 依赖 brew 的 libvpx。这里直接把归档绝对路径作为链接输入，
+            // 强制静态链接，保证单文件自包含（与 Windows 行为一致）。
+            println!("cargo:rustc-link-arg-bins={}", dir.join("libvpx.a").display());
             return;
         }
         if dir.join("libvpx.dylib").is_file() {
