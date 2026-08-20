@@ -71,6 +71,13 @@ target\release\deskpet.exe
 
 退出：托盘/状态栏图标 → 退出。
 
+## 日志
+
+写入 `<配置目录>/logs/deskpet.log`（Windows `%APPDATA%\deskpet\logs\`；
+macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自动滚动为
+`deskpet.log.old`（磁盘占用 ≤2MB）。级别由环境变量 `DESKPET_LOG` 控制
+（`off|error|warn|info|debug`，默认 `info`）。
+
 ## 配置
 
 `config.json`（路径见上）：

@@ -1,15 +1,18 @@
-//! 轻量日志：仅终端输出（不写文件）。
+//! 轻量文件日志：写入 `<配置目录>/logs/deskpet.log`。
 //!
-//! - Windows release 默认无控制台（`windows_subsystem = "windows"`）；传 `--console`
-//!   参数时 `AttachConsole` 附加父终端，用 `WriteConsoleW` 输出 Unicode 日志；
-//! - Windows debug 构建为 console 子系统，直接 `eprintln` 输出；
-//! - macOS 直接 `eprintln` 输出（终端运行可见）；
+//! - 滚动：单文件超过 1MB → 改名 `deskpet.log.old`（覆盖旧备份），新文件重写；
+//!   磁盘占用 ≤2MB，无需后台任务（每次写入前检查）。
 //! - 级别过滤：环境变量 `DESKPET_LOG`（off|error|warn|info|debug，默认 info）。
+//! - 每次写入后 flush（日志量小，每秒几行，无性能压力）。
 #![allow(dead_code)]
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(windows)]
-use std::sync::atomic::AtomicBool;
+
+/// 单文件大小上限（超过即滚动）。
+const MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -32,11 +35,8 @@ impl Level {
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
-#[cfg(windows)]
-static CONSOLE: AtomicBool = AtomicBool::new(false);
-
-/// 初始化日志。`attach_console`：Windows 下是否尝试附加父终端（`--console` 参数）。
-pub fn init(attach_console: bool) {
+/// 初始化日志：读取级别环境变量并写入启动标记。
+pub fn init() {
     if let Ok(v) = std::env::var("DESKPET_LOG") {
         let lv = match v.trim().to_ascii_lowercase().as_str() {
             "off" => 255,
@@ -48,18 +48,10 @@ pub fn init(attach_console: bool) {
         };
         LEVEL.store(lv, Ordering::Relaxed);
     }
-    #[cfg(windows)]
-    if attach_console {
-        use windows_sys::Win32::System::Console::AttachConsole;
-        unsafe {
-            if AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS) != 0 {
-                CONSOLE.store(true, Ordering::Relaxed);
-                write(Level::Info, "已附加父终端，日志输出到控制台");
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = attach_console;
+    write(
+        Level::Info,
+        &format!("==== deskpet {} 启动 ====", env!("CARGO_PKG_VERSION")),
+    );
 }
 
 /// 当前级别是否启用。
@@ -67,38 +59,50 @@ pub fn enabled(lv: Level) -> bool {
     (lv as u8) <= LEVEL.load(Ordering::Relaxed)
 }
 
-/// 写一条日志。
+/// 写一条日志（追加；超限先滚动）。
 pub fn write(lv: Level, msg: &str) {
     if !enabled(lv) {
         return;
     }
-    let line = format!("[{}] [{:<5}] {}", timestamp(), lv.as_str(), msg);
-    #[cfg(windows)]
-    {
-        if CONSOLE.load(Ordering::Relaxed) {
-            write_console(&line);
-            return;
-        }
+    let line = format!("[{}] [{:<5}] {}\n", timestamp(), lv.as_str(), msg);
+    let path = log_path();
+    // 滚动：超过上限 → 当前文件改名为 .old（覆盖旧备份）
+    if fs::metadata(&path).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
+        let _ = fs::rename(&path, path.with_extension("log.old"));
     }
-    eprintln!("{}", line);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
 }
 
-#[cfg(windows)]
-fn write_console(line: &str) {
-    use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
-        System::Console::{GetStdHandle, WriteConsoleW, STD_OUTPUT_HANDLE},
-    };
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return;
+/// 日志文件路径：`<配置目录>/logs/deskpet.log`。
+fn log_path() -> PathBuf {
+    base_dir().join("deskpet").join("logs").join("deskpet.log")
+}
+
+/// 平台配置根目录（与 config.rs 的 base dir 一致）。
+fn base_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+            })
     }
-    let mut line = line.to_string();
-    line.push('\n');
-    let wide: Vec<u16> = line.encode_utf16().collect();
-    let mut written: u32 = 0;
-    unsafe {
-        WriteConsoleW(handle, wide.as_ptr(), wide.len() as u32, &mut written, std::ptr::null());
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+            .unwrap_or_else(|_| PathBuf::from("."))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        PathBuf::from(".")
     }
 }
 

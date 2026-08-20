@@ -23,14 +23,11 @@ mod win32;
 mod macos;
 
 fn main() {
-    // 参数解析：--console（Windows release 附加父终端输出日志；macOS 忽略）
-    let attach_console = std::env::args().any(|a| a == "--console");
-    log::init(attach_console);
+    log::init();
     log_info!(
-        "deskpet {} 启动 (os={}, console={})",
+        "deskpet {} 启动 (os={})",
         env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        attach_console
+        std::env::consts::OS
     );
 
     #[cfg(windows)]
