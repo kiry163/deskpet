@@ -9,22 +9,12 @@ pub const CANVAS_H: f64 = 360.0;
 pub const PAD: f64 = 30.0; // 落地偏移：帧下移让脚踩窗口底线
 pub const FRAME_MS: u32 = 40;
 
-// 动画链概率
-pub const P_IDLE: f64 = 0.30;
-pub const P_TURN: f64 = 0.40;
-pub const P_ACTS: f64 = 0.80;
-
-// 移动参数
-pub const MOVE_MIN_PX: f64 = 60.0;
-pub const MOVE_MAX_PX: f64 = 240.0;
-pub const MOVE_MARGIN: f64 = 20.0;
+// 移动插值时间（秒）
 pub const MOVE_LEAD_SEC: f64 = 2.0;
 pub const MOVE_TAIL_SEC: f64 = 2.0;
 
 pub const DRAG_THRESHOLD: f64 = 5.0;
-pub const DEFAULT_SCALE: f64 = 0.72;
 pub const CORNER_MARGIN: f64 = 24.0;
-pub const SCALE_STEPS: [f64; 4] = [0.5, 0.72, 0.85, 1.0];
 
 // 触发类型（与 db.rs TRIGGERS 对齐；素材包无 manifest 后由管理端配置）
 pub const TRIGGER_IDLE: &str = "idle";
@@ -34,7 +24,7 @@ pub const TRIGGER_CLICK: &str = "click";
 pub const TRIGGER_DRAG: &str = "drag";
 pub const TRIGGER_IDLE_ACT: &str = "idle_act";
 
-/// 动态分类结果（对应上游 build_categories 返回）。
+/// 动态分类结果。
 pub struct Category {
     pub idle: Option<String>,
     pub turn: Option<String>,
@@ -44,6 +34,8 @@ pub struct Category {
     pub clicks: Vec<String>,
     pub drag: Option<String>,
     pub acts: Vec<String>,
+    /// 动画名 → 权重（桌宠级配置；pick 按权重随机，缺省 1.0）。
+    pub weights: HashMap<String, f64>,
 }
 
 impl Category {
@@ -57,6 +49,7 @@ impl Category {
             clicks: Vec::new(),
             drag: None,
             acts: Vec::new(),
+            weights: HashMap::new(),
         }
     }
 
@@ -71,6 +64,7 @@ impl Category {
 /// - 未登记动画默认 `idle_act`（闲时随机池）；enabled=false 的动画不入任何池；
 /// - 触发类型映射：idle→待机 / turn→转向 / move→移动 / click→点击 / drag→拖拽（取第一个）；
 ///   其余（含 idle_act 与未知）→ 闲时随机池；
+/// - 权重（weight）随分类存入 `cat.weights`（pick 按权重随机，缺省 1.0）；
 /// - 兜底：无待机动画时取第一个启用动画作为待机（保证桌宠能安静待机）。
 pub fn build_categories_from_actions(
     names: &[String],
@@ -78,10 +72,11 @@ pub fn build_categories_from_actions(
 ) -> Category {
     let mut cat = Category::empty();
     for name in names {
-        let (trigger, _weight, enabled) = actions
+        let (trigger, weight, enabled) = actions
             .get(name)
             .cloned()
             .unwrap_or_else(|| (TRIGGER_IDLE_ACT.to_string(), 1.0, true));
+        cat.weights.insert(name.clone(), weight.max(0.0));
         if !enabled {
             continue;
         }
@@ -110,44 +105,66 @@ pub fn build_categories_from_actions(
     cat
 }
 
-/// 从名称池随机选（排除 exclude）。
-pub fn pick(pool: &[String], exclude: Option<&str>) -> String {
+/// 从池中按权重随机选（排除 exclude；权重取 `weights` 中该动画的值，缺省 1.0）。
+pub fn pick(pool: &[String], weights: &HashMap<String, f64>, exclude: Option<&str>) -> String {
     if pool.is_empty() {
         return String::new();
     }
-    let mut idx = (rand_u32() as usize) % pool.len();
-    if let Some(e) = exclude {
-        if pool.len() > 1 && pool[idx] == e {
-            idx = (idx + 1) % pool.len();
+    let mut candidates: Vec<&String> = pool
+        .iter()
+        .filter(|n| Some(n.as_str()) != exclude)
+        .collect();
+    if candidates.is_empty() {
+        candidates = pool.iter().collect();
+    }
+    let w = |n: &str| weights.get(n).copied().unwrap_or(1.0).max(0.0);
+    let total: f64 = candidates.iter().map(|n| w(n)).sum();
+    if total <= 0.0 {
+        return candidates[0].clone();
+    }
+    let mut r = rand_f64() * total;
+    for n in &candidates {
+        r -= w(n);
+        if r < 0.0 {
+            return (*n).clone();
         }
     }
-    pool[idx].clone()
+    candidates.last().unwrap().to_string()
 }
 
-/// 动画链：30% 待机 / 10% 转向 / 40% 动作 / 20% 移动。
+/// 动画链：按配置占比分派 待机 / 转向 / 闲时动作 / 移动。
+/// `idle_ratio <= turn_ratio <= act_ratio <= 1`（调用方已归一化）；
 /// no_move 时移动概率并入动作；待机/转向支持多视频。
-pub fn pick_next(cat: &Category, current: &str, no_move: bool, can_move: bool) -> String {
+pub fn pick_next(
+    cat: &Category,
+    current: &str,
+    no_move: bool,
+    can_move: bool,
+    idle_ratio: f64,
+    turn_ratio: f64,
+    act_ratio: f64,
+) -> String {
     let roll = rand_f64();
-    if roll < P_IDLE {
+    if roll < idle_ratio {
         if !cat.idles.is_empty() {
-            return pick(&cat.idles, Some(current));
+            return pick(&cat.idles, &cat.weights, Some(current));
         }
-        return pick(&cat.acts, Some(current));
+        return pick(&cat.acts, &cat.weights, Some(current));
     }
-    if roll < P_TURN {
+    if roll < turn_ratio {
         if !cat.turns.is_empty() {
-            return pick(&cat.turns, Some(current));
+            return pick(&cat.turns, &cat.weights, Some(current));
         }
-        return pick(&cat.acts, Some(current));
+        return pick(&cat.acts, &cat.weights, Some(current));
     }
-    if roll < P_ACTS {
-        return pick(&cat.acts, Some(current));
+    if roll < act_ratio {
+        return pick(&cat.acts, &cat.weights, Some(current));
     }
     // 移动分支
     if !no_move && can_move && !cat.moves.is_empty() {
-        return pick(&cat.moves, None);
+        return pick(&cat.moves, &cat.weights, None);
     }
-    pick(&cat.acts, Some(current))
+    pick(&cat.acts, &cat.weights, Some(current))
 }
 
 // ---- 简易随机（xorshift + 时间种子，零依赖）----
@@ -162,10 +179,6 @@ fn next_rand() -> u64 {
     x ^= x << 17;
     SEED.store(x, Ordering::Relaxed);
     x
-}
-
-fn rand_u32() -> u32 {
-    next_rand() as u32
 }
 
 pub fn rand_f64() -> f64 {

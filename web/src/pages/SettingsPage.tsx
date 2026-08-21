@@ -1,13 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, type PetConfig } from '../api'
 
-const SCALES = [
-  { v: 0.5, label: '小' },
-  { v: 0.72, label: '中' },
-  { v: 0.85, label: '大' },
-  { v: 1.0, label: '特大' },
-]
-
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<PetConfig | null>(null)
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
@@ -38,6 +31,8 @@ export default function SettingsPage() {
 
   if (!cfg) return <div className="card"><p className="muted">加载中…</p></div>
 
+  const pct = (v: number) => Math.round(v * 100)
+
   return (
     <>
       {msg && <div className={'msg ' + (msg.ok ? 'ok' : 'err')}>{msg.text}</div>}
@@ -47,13 +42,13 @@ export default function SettingsPage() {
       <div className="card">
         <h2 className="card-title">大小</h2>
         <div className="scale-group">
-          {SCALES.map((s) => (
+          {(cfg.scale_steps.length ? cfg.scale_steps : [0.5, 0.72, 0.85, 1.0]).map((s) => (
             <button
-              key={s.v}
-              className={'scale-btn' + (cfg.scale === s.v ? ' active' : '')}
-              onClick={() => patch({ scale: s.v }, '大小')}
+              key={s}
+              className={'scale-btn' + (Math.abs(cfg.scale - s) < 0.02 ? ' active' : '')}
+              onClick={() => patch({ scale: s }, '大小')}
             >
-              {s.label}
+              {Math.round(s * 100)}%
             </button>
           ))}
         </div>
@@ -61,6 +56,63 @@ export default function SettingsPage() {
 
       <div className="card">
         <h2 className="card-title">行为</h2>
+        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+          <div>
+            <div className="label">待机 {pct(cfg.idle_ratio)}%</div>
+            <div className="desc">安静待着的时间占比（转向/动作/移动占其余）</div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={pct(cfg.idle_ratio)}
+            onChange={(e) => patch({ idle_ratio: Number(e.target.value) / 100 }, '待机占比')}
+          />
+        </div>
+        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+          <div>
+            <div className="label">转身 {pct(cfg.turn_ratio)}%</div>
+            <div className="desc">东张西望、转身的频率（含待机）</div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={pct(cfg.turn_ratio)}
+            onChange={(e) => patch({ turn_ratio: Number(e.target.value) / 100 }, '转身占比')}
+          />
+        </div>
+        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+          <div>
+            <div className="label">闲时表演 {pct(cfg.act_ratio)}%</div>
+            <div className="desc">做各种小动作的频率（含待机、转身；其余为走动）</div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={pct(cfg.act_ratio)}
+            onChange={(e) => patch({ act_ratio: Number(e.target.value) / 100 }, '闲时表演占比')}
+          />
+        </div>
+        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+          <div>
+            <div className="label">动作间隔 {cfg.act_interval_ms / 1000} 秒</div>
+            <div className="desc">每个动作结束后停顿多久再继续（0 = 不停顿）</div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={10000}
+            step={500}
+            value={cfg.act_interval_ms}
+            onChange={(e) => patch({ act_interval_ms: Number(e.target.value) }, '动作间隔')}
+          />
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 className="card-title">其他</h2>
         <div className="set-row">
           <div>
             <div className="label">总是在最前面</div>

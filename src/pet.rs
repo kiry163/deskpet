@@ -35,6 +35,42 @@ pub enum PetCommand {
     Say { text: String, duration_ms: Option<u64> },
 }
 
+/// 行为引擎参数（来自 PetConfig，阶段 3 配置化；见 docs/需求规格.md §5.2）。
+#[derive(Clone, Debug)]
+pub struct Behavior {
+    /// 待机分支概率（0..1，须 < turn_ratio）。
+    pub idle_ratio: f64,
+    /// 转向分支累积概率。
+    pub turn_ratio: f64,
+    /// 闲时动作分支累积概率（剩余为移动）。
+    pub act_ratio: f64,
+    /// 普通动画结束后停顿毫秒数（0 = 立即继续）。
+    pub act_interval_ms: u64,
+    /// 自主移动最小距离（像素）。
+    pub move_min_px: f64,
+    /// 自主移动最大距离（像素）。
+    pub move_max_px: f64,
+    /// 移动边界留白（像素）。
+    pub move_margin_px: f64,
+    /// 缩放档位（大小菜单/设置页）。
+    pub scale_steps: Vec<f64>,
+}
+
+impl From<&PetConfig> for Behavior {
+    fn from(pc: &PetConfig) -> Behavior {
+        Behavior {
+            idle_ratio: pc.idle_ratio,
+            turn_ratio: pc.turn_ratio,
+            act_ratio: pc.act_ratio,
+            act_interval_ms: pc.act_interval_ms,
+            move_min_px: pc.move_min_px,
+            move_max_px: pc.move_max_px,
+            move_margin_px: pc.move_margin_px,
+            scale_steps: pc.scale_steps.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MovePlan {
     start_x: i32,
@@ -74,6 +110,11 @@ pub struct Pet {
 
     move_plan: Option<MovePlan>,
     move_accum_ms: u64,
+
+    /// 行为引擎参数（程序级，可热更新）。
+    pub behavior: Behavior,
+    /// 动作间隔冷却（普通动画结束后等待，None = 无需等待）。
+    cooldown_until: Option<Instant>,
 
     last_tick: Instant,
 }
@@ -134,6 +175,8 @@ impl Pet {
             just_dragged: false,
             move_plan: None,
             move_accum_ms: 0,
+            behavior: Behavior::from(pc),
+            cooldown_until: None,
             last_tick: Instant::now(),
         };
         let (w, h) = pet.window_size();
@@ -297,8 +340,27 @@ impl Pet {
             self.switch_anim(&self.cats.idle.clone().unwrap_or_default());
             return;
         }
+        // 普通动画结束：若配置了动作间隔，先停顿再继续动画链
+        if self.behavior.act_interval_ms > 0 {
+            self.cooldown_until =
+                Some(Instant::now() + Duration::from_millis(self.behavior.act_interval_ms));
+            return;
+        }
+        self.pick_next_anim();
+    }
+
+    /// 动画链推进：先尝试规划移动，否则按配置占比选下一个动画。
+    fn pick_next_anim(&mut self) {
         let can_move = self.try_plan_move();
-        let next = state::pick_next(&self.cats, &name, self.no_move, can_move);
+        let next = state::pick_next(
+            &self.cats,
+            &self.cur_anim,
+            self.no_move,
+            can_move,
+            self.behavior.idle_ratio,
+            self.behavior.turn_ratio,
+            self.behavior.act_ratio,
+        );
         self.switch_anim(&next);
     }
 
@@ -311,13 +373,16 @@ impl Pet {
         let (x, _, x2, _) = self.win.get_rect();
         let cx = (x + x2) as f64 / 2.0;
         let dir_sign = if self.facing_right { 1.0 } else { -1.0 };
-        let distance = state::MOVE_MIN_PX + (state::MOVE_MAX_PX - state::MOVE_MIN_PX) * state::rand_f64();
+        let distance = self.behavior.move_min_px
+            + (self.behavior.move_max_px - self.behavior.move_min_px) * state::rand_f64();
         let target_cx = cx + dir_sign * distance;
         let half_w = wx as f64 / 2.0;
-        if target_cx < lx as f64 + state::MOVE_MARGIN + half_w || target_cx > rx as f64 - state::MOVE_MARGIN - half_w {
+        if target_cx < lx as f64 + self.behavior.move_margin_px + half_w
+            || target_cx > rx as f64 - self.behavior.move_margin_px - half_w
+        {
             return false;
         }
-        let move_name = state::pick(&self.cats.moves, None);
+        let move_name = state::pick(&self.cats.moves, &self.cats.weights, None);
         let duration_ms = self.clips.get(&move_name).map(|c| c.duration_ms()).unwrap_or(2400);
         self.switch_anim(&move_name);
         self.move_plan = Some(MovePlan {
@@ -485,7 +550,7 @@ impl Pet {
         }
         self.cancel_move();
         let c = self.cats.clicks.clone();
-        let pick = state::pick(&c, None);
+        let pick = state::pick(&c, &self.cats.weights, None);
         log_info!("点击回应: {}", pick);
         self.switch_anim(&pick);
     }
@@ -534,6 +599,16 @@ impl Pet {
         if self.frame_accum_ms >= frame_ms {
             self.frame_accum_ms = 0;
             self.advance_frame();
+        }
+
+        // 动作间隔冷却到期 → 继续动画链
+        if self.anim_ended_fired {
+            if let Some(until) = self.cooldown_until {
+                if Instant::now() >= until {
+                    self.cooldown_until = None;
+                    self.pick_next_anim();
+                }
+            }
         }
 
         if let Some(plan) = self.move_plan.clone() {
@@ -611,7 +686,7 @@ impl Pet {
             MenuEntry::check(MID_AUTOSTART, "开机自启", crate::autostart::is_enabled()),
         ];
         let mut scales = Vec::new();
-        for (i, s) in state::SCALE_STEPS.iter().enumerate() {
+        for (i, s) in self.behavior.scale_steps.iter().enumerate() {
             let pct = (s * 100.0).round() as i32;
             scales.push(MenuEntry::check(
                 MID_SCALE_BASE + i,
@@ -637,10 +712,10 @@ impl Pet {
                 self.set_no_move(on);
             }
             _ => {
-                if id >= MID_SCALE_BASE && id < MID_SCALE_BASE + 4 {
+                if id >= MID_SCALE_BASE && id < MID_SCALE_BASE + self.behavior.scale_steps.len() {
                     let i = id - MID_SCALE_BASE;
-                    if i < state::SCALE_STEPS.len() {
-                        self.change_scale(state::SCALE_STEPS[i]);
+                    if i < self.behavior.scale_steps.len() {
+                        self.change_scale(self.behavior.scale_steps[i]);
                     }
                 }
             }

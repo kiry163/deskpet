@@ -29,6 +29,15 @@ export interface PetConfig {
   character: string | null
   /** PATCH 支持但 GET 不返回（运行时字段） */
   visible?: boolean
+  // 行为引擎参数
+  idle_ratio: number
+  turn_ratio: number
+  act_ratio: number
+  act_interval_ms: number
+  move_min_px: number
+  move_max_px: number
+  move_margin_px: number
+  scale_steps: number[]
 }
 
 export interface PetInfo {

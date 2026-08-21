@@ -506,6 +506,66 @@ impl App {
             }
             applied.push("visible");
         }
+        // 行为引擎参数（阶段 3）
+        let mut behavior_changed = false;
+        if let Some(v) = o.get("idle_ratio").and_then(|x| x.as_f64()) {
+            self.cfg.pet.idle_ratio = v;
+            behavior_changed = true;
+            applied.push("idle_ratio");
+        }
+        if let Some(v) = o.get("turn_ratio").and_then(|x| x.as_f64()) {
+            self.cfg.pet.turn_ratio = v;
+            behavior_changed = true;
+            applied.push("turn_ratio");
+        }
+        if let Some(v) = o.get("act_ratio").and_then(|x| x.as_f64()) {
+            self.cfg.pet.act_ratio = v;
+            behavior_changed = true;
+            applied.push("act_ratio");
+        }
+        if let Some(v) = o.get("act_interval_ms").and_then(|x| x.as_u64()) {
+            self.cfg.pet.act_interval_ms = v;
+            behavior_changed = true;
+            applied.push("act_interval_ms");
+        }
+        if let Some(v) = o.get("move_min_px").and_then(|x| x.as_f64()) {
+            self.cfg.pet.move_min_px = v;
+            behavior_changed = true;
+            applied.push("move_min_px");
+        }
+        if let Some(v) = o.get("move_max_px").and_then(|x| x.as_f64()) {
+            self.cfg.pet.move_max_px = v;
+            behavior_changed = true;
+            applied.push("move_max_px");
+        }
+        if let Some(v) = o.get("move_margin_px").and_then(|x| x.as_f64()) {
+            self.cfg.pet.move_margin_px = v;
+            behavior_changed = true;
+            applied.push("move_margin_px");
+        }
+        if let Some(v) = o.get("scale_steps").and_then(|x| x.as_array()) {
+            let steps: Vec<f64> = v.iter().filter_map(|x| x.as_f64()).collect();
+            if !steps.is_empty() {
+                self.cfg.pet.scale_steps = steps;
+                behavior_changed = true;
+                applied.push("scale_steps");
+            }
+        }
+        if behavior_changed {
+            self.cfg.pet.normalize_behavior();
+            if let Some(p) = &mut self.pet {
+                p.behavior = crate::pet::Behavior::from(&self.cfg.pet);
+            }
+            log_info!(
+                "行为参数已更新: idle={} turn={} act={} interval={}ms move={}-{}",
+                self.cfg.pet.idle_ratio,
+                self.cfg.pet.turn_ratio,
+                self.cfg.pet.act_ratio,
+                self.cfg.pet.act_interval_ms,
+                self.cfg.pet.move_min_px,
+                self.cfg.pet.move_max_px,
+            );
+        }
         self.cfg.save();
         json!({"ok": true, "data": {"applied": applied}})
     }
