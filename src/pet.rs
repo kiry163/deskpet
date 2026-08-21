@@ -55,6 +55,12 @@ pub struct Pet {
     pub win_topmost: bool,
     pub visible: bool,
     pub render_buf: Vec<u8>,
+    /// 共享 VP9 解码器（全部动画共用一组；一次只播一个动画，首帧关键帧重置
+    /// 参考帧状态。避免每动画独立解码器导致 ~6MB×动画数的帧缓冲池累积）
+    color_dec: crate::vpx::Decoder,
+    alpha_dec: Option<crate::vpx::Decoder>,
+    /// 共享合成缓冲（全部动画共用，避免 51×921KB 独立缓冲）
+    comp_buf: Vec<u8>,
     pub frame_accum_ms: u64,
     pub anim_ended_fired: bool,
     /// 说话气泡（None = 无）。
@@ -114,6 +120,9 @@ impl Pet {
             win_topmost: pc.always_on_top,
             visible: true,
             render_buf: vec![0u8; W * (H + 30) * 4],
+            color_dec: crate::vpx::Decoder::new(4).expect("libvpx 主色解码器初始化失败"),
+            alpha_dec: crate::vpx::Decoder::new(2),
+            comp_buf: Vec::new(),
             frame_accum_ms: 0,
             anim_ended_fired: false,
             bubble: None,
@@ -249,7 +258,7 @@ impl Pet {
             if idx >= clip.frame_count() {
                 return;
             }
-            let frame = clip.next_frame();
+            let frame = clip.next_frame(&mut self.color_dec, self.alpha_dec.as_mut(), &mut self.comp_buf);
             if let Some(frame) = frame {
                 let dst_h = self.render_buf.len() / (w * 4);
                 self.render_buf.fill(0);
@@ -562,7 +571,7 @@ impl Pet {
                 // 先取尺寸（借用立即结束），再借可变 next_frame
                 w = clip.webm.width as usize;
                 h = clip.webm.height as usize;
-                clip.next_frame()
+                clip.next_frame(&mut self.color_dec, self.alpha_dec.as_mut(), &mut self.comp_buf)
             }
             None => None,
         };

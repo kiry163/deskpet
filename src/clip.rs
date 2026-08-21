@@ -2,28 +2,27 @@
 #![allow(dead_code)]
 use std::rc::Rc;
 
-use crate::vpx::{self, vpx_image_t, VPX_PLANE_ALPHA, VPX_PLANE_U, VPX_PLANE_V, VPX_PLANE_Y};
+use crate::vpx::{vpx_image_t, VPX_PLANE_ALPHA, VPX_PLANE_U, VPX_PLANE_V, VPX_PLANE_Y};
 use crate::webm::WebM;
 
 pub const W: usize = 640;
 pub const H: usize = 360;
 
-/// 单个动画的逐帧解码器（素材 Rc 共享，解码器各宠物独立）。
+/// 单个动画的逐帧解码器。
+///
+/// 解码器不在此持有：全部动画共享 Pet 级的一组解码器（一次只播一个动画，
+/// 且各动画首帧均为 VP9 关键帧——见 check_keyframe，解码关键帧即重置参考帧
+/// 状态）。若每动画独立持有一组解码器，其惰性分配的帧缓冲池会累积
+/// ~6MB×动画数（51 段 ≈ 300MB）且不复用，长时间运行内存持续增长。
 pub struct ClipDecoder {
     pub webm: Rc<WebM>,
-    color_dec: vpx::Decoder,
-    alpha_dec: Option<vpx::Decoder>,
     pub cur: usize,
     // 查找表
     ytab: [i32; 256],
-    /// 合成输出缓冲（复用，避免每帧分配 ~921KB）
-    out: Vec<u8>,
 }
 
 impl ClipDecoder {
     pub fn new(webm: Rc<WebM>) -> Option<ClipDecoder> {
-        let color_dec = vpx::Decoder::new(4)?;
-        let alpha_dec = webm.frames.iter().any(|f| f.alpha.is_some()).then(|| vpx::Decoder::new(2)).flatten();
         // 预计算 YUV->RGB 有限范围 BT.601 亮度系数
         let mut ytab = [0i32; 256];
         for i in 0..256usize {
@@ -32,25 +31,21 @@ impl ClipDecoder {
         }
         Some(ClipDecoder {
             webm,
-            color_dec,
-            alpha_dec,
             cur: 0,
             ytab,
-            out: Vec::new(),
         })
     }
 
-    /// 跳到指定帧（重播时从 0 开始）。重建解码器以清空参考帧状态。
+    /// 跳到指定帧（重播时从 0 开始）。
+    ///
+    /// 无需重建/重置解码器：全部素材首帧均为 VP9 关键帧（check_keyframe 已验证
+    /// 51/51，含 alpha 帧），解码关键帧即重置参考帧状态。解码器由 Pet 级共享，
+    /// 常驻整个生命周期（见结构体注释）。
     pub fn seek(&mut self, idx: usize) {
         if self.cur == idx {
             return;
         }
         self.cur = idx;
-        // 重建解码器（清空 VP9 参考帧）
-        self.color_dec = vpx::Decoder::new(4).unwrap_or_else(|| vpx::Decoder::new(2).unwrap());
-        if self.alpha_dec.is_some() {
-            self.alpha_dec = Some(vpx::Decoder::new(2).unwrap());
-        }
     }
 
     pub fn frame_count(&self) -> usize {
@@ -71,24 +66,27 @@ impl ClipDecoder {
     }
 
     /// 解码并返回当前帧 BGRA（premultiplied alpha），推进到下一帧。
-    /// 返回借用的合成缓冲（复用，不重新分配）；None 表示播完。
-    pub fn next_frame(&mut self) -> Option<&[u8]> {
+    /// 返回借用的合成缓冲（Pet 级共享，复用不重新分配）；None 表示播完。
+    /// `color_dec` / `alpha_dec` / `out` 均为 Pet 级共享资源（本 clip 不持有）。
+    pub fn next_frame<'o>(
+        &mut self,
+        color_dec: &mut crate::vpx::Decoder,
+        alpha_dec: Option<&mut crate::vpx::Decoder>,
+        out: &'o mut Vec<u8>,
+    ) -> Option<&'o [u8]> {
         if self.cur >= self.webm.frames.len() {
             return None;
         }
         // 借用帧数据（不 clone，避免每帧 ~921KB 拷贝 + 分配）
         let f = &self.webm.frames[self.cur];
         self.cur += 1;
-        let color = self.color_dec.decode(&f.video)?;
-        let alpha = match &f.alpha {
-            Some(a) => {
-                let ad = self.alpha_dec.as_mut()?;
-                ad.decode(a)
-            }
-            None => None,
+        let color = color_dec.decode(&f.video)?;
+        let alpha = match (&f.alpha, alpha_dec) {
+            (Some(a), Some(ad)) => ad.decode(a),
+            _ => None,
         };
-        compose_into(color, alpha, &self.ytab, &mut self.out);
-        Some(&self.out)
+        compose_into(color, alpha, &self.ytab, out);
+        Some(out)
     }
 }
 

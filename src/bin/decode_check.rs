@@ -60,6 +60,10 @@ fn main() {
     println!("{}: {} 帧, fps={:.1}, 尺寸 {}x{}", target, wm.frames.len(), wm.fps, wm.width, wm.height);
 
     let mut dec = clip::ClipDecoder::new(Rc::new(wm)).unwrap();
+    // 共享解码器方案下解码器由 Pet 级持有；此处自建一组用于独立验证
+    let mut color_dec = vpx::Decoder::new(4).unwrap();
+    let mut alpha_dec = vpx::Decoder::new(2).unwrap();
+    let mut comp_buf: Vec<u8> = Vec::new();
 
     // 直接解码 image 结构检查
     {
@@ -78,7 +82,7 @@ fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    let frame = dec.next_frame().expect("解码第一帧失败");
+    let frame = dec.next_frame(&mut color_dec, Some(&mut alpha_dec), &mut comp_buf).expect("解码第一帧失败");
     let dec_ms = t0.elapsed().as_millis();
     println!("第一帧解码耗时: {}ms, 缓冲 {}B", dec_ms, frame.len());
 
@@ -107,7 +111,7 @@ fn main() {
     // 3. 连续解码 10 帧测性能
     let t0 = std::time::Instant::now();
     let mut n = 0;
-    while let Some(_) = dec.next_frame() {
+    while let Some(_) = dec.next_frame(&mut color_dec, Some(&mut alpha_dec), &mut comp_buf) {
         n += 1;
         if n >= 20 {
             break;
