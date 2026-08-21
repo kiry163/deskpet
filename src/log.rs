@@ -59,6 +59,20 @@ pub fn enabled(lv: Level) -> bool {
     (lv as u8) <= LEVEL.load(Ordering::Relaxed)
 }
 
+/// 解析级别字符串并设置（off|error|warn|info|debug，未知值忽略）。
+pub fn set_level_str(s: &str) {
+    let lv = match s.trim().to_ascii_lowercase().as_str() {
+        "off" => 255,
+        "error" => Level::Error as u8,
+        "warn" => Level::Warn as u8,
+        "info" => Level::Info as u8,
+        "debug" => Level::Debug as u8,
+        _ => return,
+    };
+    LEVEL.store(lv, Ordering::Relaxed);
+    let _ = write(Level::Info, &format!("日志级别已配置为 {}", s.trim()));
+}
+
 /// 写一条日志（追加；超限先滚动）。
 pub fn write(lv: Level, msg: &str) {
     if !enabled(lv) {

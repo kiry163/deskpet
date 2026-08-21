@@ -7,7 +7,6 @@ mod vpx;
 #[path = "../clip.rs"]
 mod clip;
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -16,11 +15,11 @@ fn main() {
     let assets_dir = args_assets_dir();
     println!("素材根: {}", assets_dir.display());
     let Some(role_dir) = resolve_character_dir(&assets_dir) else {
-        println!("[FAIL] 找不到角色素材目录");
+        println!("[FAIL] 找不到桌宠素材目录（无含 webm 的子目录）");
         std::process::exit(1);
     };
-    println!("角色目录: {}", role_dir.display());
-    let (files, _folders) = scan_videos(&role_dir);
+    println!("桌宠目录: {}", role_dir.display());
+    let files = scan_webm_files(&role_dir);
     if files.is_empty() {
         println!("[FAIL] 素材目录无 webm");
         std::process::exit(1);
@@ -49,12 +48,9 @@ fn main() {
     }
     println!("=== 解析成功 {} / {}，总帧数 {} ===", ok, files.len(), total_frames);
 
-    // 2. 待机动画解码第一帧，验证 alpha
-    let target = "待机呼吸休闲";
-    let Some((_, path)) = files.iter().find(|(n, _)| n == target) else {
-        println!("[FAIL] 找不到待机动画: {}", target);
-        std::process::exit(1);
-    };
+    // 2. 首个动画解码第一帧，验证 alpha
+    let (name, path) = &files[0];
+    let target = name.clone();
     let data = fs::read(path).unwrap();
     let wm = webm::WebM::parse(&data).unwrap();
     println!("{}: {} 帧, fps={:.1}, 尺寸 {}x{}", target, wm.frames.len(), wm.fps, wm.width, wm.height);
@@ -145,59 +141,41 @@ fn args_assets_dir() -> PathBuf {
     cwd.join("assets")
 }
 
-/// 角色目录：第一个含 videos/ 或 manifest.json 的子目录；否则自身。
+/// 桌宠目录：第一个含 webm 的子目录；否则自身（新素材布局：平铺 webm，无 manifest）。
 fn resolve_character_dir(assets_dir: &Path) -> Option<PathBuf> {
     if let Ok(rd) = fs::read_dir(assets_dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() && (p.join("videos").is_dir() || p.join("manifest.json").is_file()) {
+            if p.is_dir() && !scan_webm_files(&p).is_empty() {
                 return Some(p);
             }
         }
     }
-    if assets_dir.join("videos").is_dir() || assets_dir.join("manifest.json").is_file() {
+    if !scan_webm_files(assets_dir).is_empty() {
         return Some(assets_dir.to_path_buf());
     }
     None
 }
 
-/// 扫描 videos/：顶层 flat + 动作子目录，返回 (name, path) 列表与子目录分类。
-fn scan_videos(dir: &Path) -> (Vec<(String, PathBuf)>, HashMap<String, Vec<String>>) {
-    let videos = dir.join("videos");
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    let mut folders: HashMap<String, Vec<String>> = HashMap::new();
-    if !videos.is_dir() {
-        return (files, folders);
-    }
-    if let Ok(rd) = fs::read_dir(&videos) {
+/// 递归收集全部 webm → (文件名 stem, 路径)。同 stem 冲突保留第一个。
+fn scan_webm_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let folder = p.file_name().unwrap().to_string_lossy().to_string();
-            let mut names = Vec::new();
-            if let Ok(rd2) = fs::read_dir(&p) {
-                let mut sub: Vec<PathBuf> = rd2.flatten().map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "webm")).collect();
-                sub.sort();
-                for f in sub {
-                    let name = f.file_stem().unwrap().to_string_lossy().to_string();
-                    names.push(name.clone());
-                    files.push((name, f));
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("webm")) {
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                if !stem.is_empty() && seen.insert(stem.clone()) {
+                    out.push((stem, p));
                 }
             }
-            if !names.is_empty() {
-                folders.insert(folder, names);
-            }
         }
     }
-    if let Ok(rd) = fs::read_dir(&videos) {
-        let mut top: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().map_or(false, |x| x == "webm")).collect();
-        top.sort();
-        for f in top {
-            let name = f.file_stem().unwrap().to_string_lossy().to_string();
-            files.push((name, f));
-        }
-    }
-    (files, folders)
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }

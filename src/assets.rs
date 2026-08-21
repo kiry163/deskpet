@@ -1,14 +1,8 @@
 //! 素材加载：运行时从外部目录读取（与软件分离）。
 //!
-//! 目录约定（见 docs/需求规格.md §1.3）：
-//! ```text
-//! <assets_dir>/<角色>/
-//! ├── manifest.json          # 角色元数据 + 动作分类（可缺省）
-//! └── videos/                # 动作 webm；可用动作语义子目录（idle/turn/move/click/drag/random）
-//! ```
-//! 角色解析：配置 `character` 指定 → `<assets_dir>/<character>`；
-//! 否则取 `<assets_dir>` 下第一个含 `videos/` 或 `manifest.json` 的子目录；
-//! 最后回退 `<assets_dir>` 本身（兼容扁平结构）。
+//! 素材包简化后（见 docs/需求规格.md §4）：素材集目录 = 若干 webm 平铺（任意目录层级），
+//! **无 manifest.json / videos 结构要求**；动画名 = webm 文件名 stem（目录内唯一）；
+//! 动作分类（触发类型）由管理端在 SQLite 中配置，加载时由调用方传入动作映射。
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -18,14 +12,10 @@ use std::rc::Rc;
 
 use crate::webm::WebM;
 
-/// 素材集（角色）。
+/// 素材集（桌宠）。
 pub struct RoleAssets {
     /// 动画名 → 解析后的 WebM（Rc 共享）。
     pub videos: HashMap<String, Rc<WebM>>,
-    /// videos/ 子目录 → 动画名列表（无子目录时为空 → flat 分类）。
-    pub folder_files: HashMap<String, Vec<String>>,
-    /// manifest.json 内容（无则 None）。
-    pub manifest: Option<serde_json::Value>,
     /// 动画名列表（videos 的键）。
     pub names: Vec<String>,
 }
@@ -67,16 +57,16 @@ pub fn resolve_assets_dir(configured: Option<&str>, config_dir: &Path) -> PathBu
     cfg_assets
 }
 
-/// 从素材根目录加载角色。失败返回 None（无目录/无素材/解析全部失败）。
+/// 从素材根目录加载素材集。失败返回 None（无目录/无素材/解析全部失败）。
 pub fn load(assets_dir: &Path, character: Option<&str>) -> Option<RoleAssets> {
     log_debug!("素材根目录: {}", assets_dir.display());
     let dir = resolve_character_dir(assets_dir, character)?;
-    log_info!("角色素材目录: {}", dir.display());
+    log_info!("桌宠素材目录: {}", dir.display());
     load_from_dir(&dir)
 }
 
-/// 角色目录解析：character 指定 → assets_dir/character；否则第一个含 videos/ 或
-/// manifest.json 的子目录；最后回退 assets_dir 本身（兼容扁平结构）。
+/// 桌宠目录解析：character 指定 → assets_dir/character；否则第一个含 webm 的子目录；
+/// 最后回退 assets_dir 本身（兼容扁平结构）。
 fn resolve_character_dir(assets_dir: &Path, character: Option<&str>) -> Option<PathBuf> {
     if let Some(c) = character {
         let c = c.trim();
@@ -85,7 +75,7 @@ fn resolve_character_dir(assets_dir: &Path, character: Option<&str>) -> Option<P
             if is_character_dir(&p) {
                 return Some(p);
             }
-            log_warn!("指定角色目录不存在: {}", p.display());
+            log_warn!("指定桌宠素材目录不存在: {}", p.display());
             return None;
         }
     }
@@ -100,86 +90,54 @@ fn resolve_character_dir(assets_dir: &Path, character: Option<&str>) -> Option<P
         return Some(assets_dir.to_path_buf());
     }
     log_error!(
-        "找不到角色素材目录（{}/ 下无含 videos/ 或 manifest.json 的子目录）",
+        "找不到桌宠素材目录（{}/ 下无含 webm 的子目录）",
         assets_dir.display()
     );
     None
 }
 
-/// 角色目录特征：含 videos/ 子目录或 manifest.json。
+/// 桌宠目录特征：递归含至少一个 *.webm。
 fn is_character_dir(dir: &Path) -> bool {
-    dir.join("videos").is_dir() || dir.join("manifest.json").is_file()
+    !scan_webm_files(dir).is_empty()
 }
 
-/// 扫描 videos/：收集全部 webm（顶层 flat + 动作子目录），返回 (文件列表, 子目录分类)。
-fn scan_videos(dir: &Path) -> (Vec<(String, PathBuf)>, HashMap<String, Vec<String>>) {
-    let videos = dir.join("videos");
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    let mut folder_files: HashMap<String, Vec<String>> = HashMap::new();
-    if !videos.is_dir() {
-        log_warn!("缺少 videos/ 子目录: {}", videos.display());
-        return (files, folder_files);
-    }
-    // 动作子目录（idle/turn/move/click/drag/random 等）
-    if let Ok(rd) = fs::read_dir(&videos) {
+/// 列出素材目录内全部动画名（webm 文件名 stem，递归，同 stem 去重）。
+pub fn scan_webm_names(role_dir: &Path) -> Vec<String> {
+    scan_webm_files(role_dir).into_iter().map(|(n, _)| n).collect()
+}
+
+/// 递归收集目录内全部 *.webm → (文件名 stem, 路径)。同 stem 冲突保留第一个。
+fn scan_webm_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let folder = p.file_name().unwrap().to_string_lossy().to_string();
-            let mut sub: Vec<PathBuf> = fs::read_dir(&p)
-                .map(|rd2| rd2.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default();
-            sub.sort();
-            let mut names: Vec<String> = Vec::new();
-            for f in sub {
-                if f.extension().map_or(false, |x| x == "webm") {
-                    let name = f.file_stem().unwrap().to_string_lossy().to_string();
-                    names.push(name.clone());
-                    files.push((name, f));
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("webm")) {
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                if !stem.is_empty() && seen.insert(stem.clone()) {
+                    out.push((stem, p));
                 }
-            }
-            if !names.is_empty() {
-                folder_files.insert(folder, names);
             }
         }
     }
-    // 顶层 webm（flat 结构）
-    let mut top: Vec<PathBuf> = fs::read_dir(&videos)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().map_or(false, |x| x == "webm"))
-                .collect()
-        })
-        .unwrap_or_default();
-    top.sort();
-    for f in top {
-        let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        files.push((name, f));
-    }
-    (files, folder_files)
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
-/// 从角色目录加载并解析全部 webm。
+/// 从桌宠素材目录加载并解析全部 webm。
 fn load_from_dir(dir: &Path) -> Option<RoleAssets> {
-    let (files, folder_files) = scan_videos(dir);
+    let files = scan_webm_files(dir);
     if files.is_empty() {
-        log_error!("素材目录无 webm: {}", dir.join("videos").display());
+        log_error!("素材目录无 webm: {}", dir.display());
         return None;
     }
     log_debug!("扫描到 {} 个 webm", files.len());
 
-    // manifest.json（可选）
-    let manifest = fs::read_to_string(dir.join("manifest.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-    if manifest.is_some() {
-        log_debug!("读取 manifest.json");
-    }
-
-    // 解析 webm
     let mut videos: HashMap<String, Rc<WebM>> = HashMap::new();
     let mut failed: Vec<String> = Vec::new();
     for (name, path) in &files {
@@ -203,10 +161,5 @@ fn load_from_dir(dir: &Path) -> Option<RoleAssets> {
     log_info!("素材加载完成: {} 段动画", videos.len());
 
     let names: Vec<String> = videos.keys().cloned().collect();
-    Some(RoleAssets {
-        videos,
-        folder_files,
-        manifest,
-        names,
-    })
+    Some(RoleAssets { videos, names })
 }

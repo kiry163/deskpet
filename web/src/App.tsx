@@ -1,23 +1,23 @@
 import { useState } from 'react'
-import StatePage from './pages/StatePage'
-import ImportPage from './pages/ImportPage'
-import ConfigPage from './pages/ConfigPage'
+import DashboardPage from './pages/DashboardPage'
+import PetsPage from './pages/PetsPage'
+import SettingsPage from './pages/SettingsPage'
 
-type Tab = 'state' | 'import' | 'config'
+type Tab = 'home' | 'pets' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'state', label: '状态' },
-  { id: 'import', label: '导入' },
-  { id: 'config', label: '配置' },
+  { id: 'home', label: '主页' },
+  { id: 'pets', label: '我的桌宠' },
+  { id: 'settings', label: '设置' },
 ]
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>('state')
+  const [tab, setTab] = useState<Tab>('home')
 
   return (
     <div>
       <header className="topbar">
-        <span className="logo">🐱 deskpet 控制台</span>
+        <span className="logo">🐱 桌宠</span>
         <nav>
           {TABS.map((t) => (
             <button
@@ -31,9 +31,9 @@ export default function App() {
         </nav>
       </header>
       <main>
-        {tab === 'state' && <StatePage />}
-        {tab === 'import' && <ImportPage />}
-        {tab === 'config' && <ConfigPage />}
+        {tab === 'home' && <DashboardPage />}
+        {tab === 'pets' && <PetsPage />}
+        {tab === 'settings' && <SettingsPage />}
       </main>
     </div>
   )

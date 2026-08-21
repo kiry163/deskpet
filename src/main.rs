@@ -9,6 +9,7 @@ mod autostart;
 mod clip;
 mod config;
 mod control;
+mod db;
 mod gfx;
 mod import;
 mod menu;
@@ -53,8 +54,9 @@ fn main() {
     let (api_tx, api_rx) = std::sync::mpsc::channel();
     let mut app = app::App::new(api_rx);
     let assets_root =
-        crate::assets::resolve_assets_dir(app.cfg.pet.assets_dir.as_deref(), &app.cfg.dir);
-    app.console = control::ControlServer::start(api_tx, app.cfg.dir.clone(), assets_root);
+        crate::assets::resolve_assets_dir(app.cfg.sys.assets_dir.as_deref(), &app.cfg.dir);
+    let port = app.cfg.sys.console_port.unwrap_or(18686);
+    app.console = control::ControlServer::start(api_tx, app.cfg.dir.clone(), assets_root, port);
     if app.console.is_none() {
         log_error!("控制服务启动失败（端口绑定失败）");
     }

@@ -25,8 +25,8 @@ pub struct App {
 impl App {
     pub fn new(api_rx: mpsc::Receiver<ApiRequest>) -> App {
         let cfg = Config::load();
-        let assets_dir = crate::assets::resolve_assets_dir(cfg.pet.assets_dir.as_deref(), &cfg.dir);
-        let role = crate::assets::load(&assets_dir, cfg.pet.character.as_deref()).map(std::rc::Rc::new);
+        let assets_dir = crate::assets::resolve_assets_dir(cfg.sys.assets_dir.as_deref(), &cfg.dir);
+        let role = crate::assets::load(&assets_dir, cfg.pet.character.as_deref());
         // 窗口始终创建：无素材时也保留（Windows 托盘/定时器需要 hwnd），导入后交给 Pet。
         let win = crate::platform::PetWindow::create(cfg.pet.always_on_top);
         let mut app = App {
@@ -39,7 +39,12 @@ impl App {
         };
         match (win, role) {
             (Some(win), Some(role)) => {
-                let mut pet = Pet::new(win, &role, &app.cfg.pet);
+                let actions = app
+                    .cfg
+                    .db
+                    .actions_map(app.cfg.pet.character.as_deref().unwrap_or(""))
+                    .unwrap_or_default();
+                let mut pet = Pet::new(win, &role, &app.cfg.pet, &actions);
                 pet.restore_position(&app.cfg.pet);
                 app.pet = Some(pet);
             }
@@ -186,10 +191,30 @@ impl App {
                 }
                 None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
             },
-            ApiOp::ApplyImport { id } => match self.apply_import(&id) {
+            ApiOp::ApplyImport { id, videos } => match self.apply_import(&id, &videos) {
                 Ok(()) => json!({"ok": true, "data": {"character": id}}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
+            ApiOp::PetsList => self.api_pets(),
+            ApiOp::SwitchPet { id } => match self.switch_pet(&id) {
+                Ok(()) => json!({"ok": true, "data": {"current": id}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::DeletePet { id, delete_files } => match self.delete_pet(&id, delete_files) {
+                Ok(()) => json!({"ok": true, "data": {"deleted": id}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::GetPetActions { id } => match self.pet_actions(&id) {
+                Ok(list) => json!({"ok": true, "data": list}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::SavePetActions { id, actions } => match self.save_pet_actions(&id, &actions) {
+                Ok(()) => json!({"ok": true, "data": {"saved": actions.len()}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::GetSettings => self.api_get_config(),
+            ApiOp::PatchSettings(v) => self.api_patch_config(v),
+            ApiOp::GetSystem => self.api_get_system(),
             // Quit 由 drain_api 特判（先回复再退出），此处兜底
             ApiOp::Quit => json!({"ok": true, "data": {"msg": "bye"}}),
         }
@@ -250,30 +275,161 @@ impl App {
         json!({"ok": true, "data": {"applied": applied}})
     }
 
-    /// 应用导入结果：设置当前角色 → 落盘 → 热加载素材（无桌宠则用保留窗口创建）。
-    fn apply_import(&mut self, id: &str) -> Result<(), String> {
-        self.cfg.pet.character = Some(id.to_string());
-        self.cfg.save();
-        self.reload_assets()
+    /// 应用导入结果：注册桌宠（DB）→ 默认动作配置 → （仅当前无桌宠时）设为当前并加载。
+    fn apply_import(&mut self, id: &str, videos: &[String]) -> Result<(), String> {
+        self.cfg.db.insert_pet(id, id, "zip").map_err(|e| e)?;
+        // 默认动作配置：全部动画 → 闲时随机池（管理端可改）
+        let actions: Vec<(String, String, f64, bool)> = videos
+            .iter()
+            .map(|a| (a.clone(), crate::state::TRIGGER_IDLE_ACT.to_string(), 1.0, true))
+            .collect();
+        self.cfg.db.replace_actions(id, &actions).map_err(|e| e)?;
+        self.cfg.db.log_import(Some(id), id, "ok", "");
+        // 不自动切换：仅当当前无桌宠时设为当前（已有桌宠时由管理端手动切换）
+        if self.cfg.pet.character.is_none() {
+            self.cfg.pet.character = Some(id.to_string());
+            self.cfg.save();
+            self.reload_assets()?;
+        }
+        Ok(())
     }
 
     /// 重新加载素材（导入后 / 角色切换）：pet 存在则热替换，否则用保留窗口创建。
     pub fn reload_assets(&mut self) -> Result<(), String> {
         let assets_dir =
-            crate::assets::resolve_assets_dir(self.cfg.pet.assets_dir.as_deref(), &self.cfg.dir);
-        let role = crate::assets::load(&assets_dir, self.cfg.pet.character.as_deref())
-            .map(std::rc::Rc::new)
-            .ok_or_else(|| format!("素材加载失败（{} 下无有效角色）", assets_dir.display()))?;
+            crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        let character = self.cfg.pet.character.clone();
+        let role = crate::assets::load(&assets_dir, character.as_deref())
+            .ok_or_else(|| format!("素材加载失败（{} 下无有效素材集）", assets_dir.display()))?;
+        let actions = match &character {
+            Some(c) => self.cfg.db.actions_map(c).unwrap_or_default(),
+            None => std::collections::HashMap::new(),
+        };
         match &mut self.pet {
-            Some(pet) => pet.swap_role(&role),
+            Some(pet) => pet.swap_role(&role, &actions),
             None => {
                 let win = self.win.take().ok_or_else(|| "无可用窗口".to_string())?;
-                let mut pet = Pet::new(win, &role, &self.cfg.pet);
+                let mut pet = Pet::new(win, &role, &self.cfg.pet, &actions);
                 pet.restore_position(&self.cfg.pet);
                 self.pet = Some(pet);
             }
         }
         Ok(())
+    }
+
+    // ---------------- 桌宠管理（阶段 2 API） ----------------
+
+    fn api_pets(&self) -> serde_json::Value {
+        use serde_json::json;
+        let pets = match self.cfg.db.list_pets() {
+            Ok(p) => p,
+            Err(e) => return json!({"ok": false, "error": e}),
+        };
+        let current = self.cfg.pet.character.as_deref();
+        let assets_dir =
+            crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        let list: Vec<serde_json::Value> = pets
+            .iter()
+            .map(|p| {
+                let video_count = crate::assets::scan_webm_names(&assets_dir.join(&p.id)).len();
+                json!({
+                    "id": p.id,
+                    "display_name": p.display_name,
+                    "source": p.source,
+                    "imported_at": p.imported_at,
+                    "builtin": p.builtin,
+                    "video_count": video_count,
+                    "is_current": current == Some(p.id.as_str()),
+                })
+            })
+            .collect();
+        json!({"ok": true, "data": list})
+    }
+
+    fn switch_pet(&mut self, id: &str) -> Result<(), String> {
+        let assets_dir =
+            crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        if crate::assets::load(&assets_dir, Some(id)).is_none() {
+            return Err(format!("素材加载失败: {}", id));
+        }
+        self.cfg.pet.character = Some(id.to_string());
+        self.cfg.save();
+        self.reload_assets()?;
+        log_info!("切换当前桌宠 -> {}", id);
+        Ok(())
+    }
+
+    fn delete_pet(&mut self, id: &str, delete_files: bool) -> Result<(), String> {
+        // 若删除的是当前桌宠：卸载 pet（隐藏窗口，回退到无素材状态）
+        if self.cfg.pet.character.as_deref() == Some(id) {
+            if let Some(pet) = self.pet.take() {
+                let win = pet.win;
+                win.hide();
+                self.win = Some(win);
+            }
+            self.cfg.pet.character = None;
+            self.cfg.save();
+        }
+        self.cfg.db.delete_pet(id).map_err(|e| e)?;
+        if delete_files {
+            let assets_dir =
+                crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+            let dir = assets_dir.join(id);
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| format!("删除素材目录失败: {}", e))?;
+                log_info!("已删除素材目录: {}", dir.display());
+            }
+        }
+        log_info!("已删除桌宠: {}", id);
+        Ok(())
+    }
+
+    /// 桌宠动作配置：动画清单以文件系统为准 + DB 覆盖（未登记默认 idle_act）。
+    fn pet_actions(&self, id: &str) -> Result<Vec<serde_json::Value>, String> {
+        use serde_json::json;
+        let assets_dir =
+            crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        let names = crate::assets::scan_webm_names(&assets_dir.join(id));
+        let map = self.cfg.db.actions_map(id).unwrap_or_default();
+        let mut out = Vec::new();
+        for n in names {
+            let (trigger, weight, enabled) = map
+                .get(&n)
+                .cloned()
+                .unwrap_or_else(|| (crate::state::TRIGGER_IDLE_ACT.to_string(), 1.0, true));
+            out.push(json!({"action": n, "trigger": trigger, "weight": weight, "enabled": enabled}));
+        }
+        Ok(out)
+    }
+
+    fn save_pet_actions(&mut self, id: &str, actions: &[(String, String, f64, bool)]) -> Result<(), String> {
+        self.cfg.db.replace_actions(id, actions).map_err(|e| e)?;
+        // 若保存的是当前桌宠 → 热生效
+        if self.cfg.pet.character.as_deref() == Some(id) {
+            self.reload_assets()?;
+        }
+        Ok(())
+    }
+
+    fn api_get_system(&self) -> serde_json::Value {
+        use serde_json::json;
+        let assets_dir =
+            crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        json!({
+            "ok": true,
+            "data": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "os": std::env::consts::OS,
+                "port": self.console.as_ref().map(|c| c.port),
+                "url": self.console.as_ref().map(|c| c.url.clone()),
+                "config_dir": self.cfg.dir,
+                "yaml_path": self.cfg.yaml_path,
+                "db_path": self.cfg.db.path,
+                "assets_dir": assets_dir,
+                "console_port": self.cfg.sys.console_port,
+                "log_level": self.cfg.sys.log_level,
+            }
+        })
     }
 
     fn api_state(&self) -> serde_json::Value {

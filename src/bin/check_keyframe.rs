@@ -94,15 +94,22 @@ fn resolve_character_dir(assets_dir: &Path) -> Option<PathBuf> {
     if let Ok(rd) = fs::read_dir(assets_dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() && (p.join("videos").is_dir() || p.join("manifest.json").is_file()) {
+            if p.is_dir() && contains_webm(&p) {
                 return Some(p);
             }
         }
     }
-    if assets_dir.join("videos").is_dir() || assets_dir.join("manifest.json").is_file() {
+    if contains_webm(assets_dir) {
         return Some(assets_dir.to_path_buf());
     }
     None
+}
+
+/// 递归含至少一个 *.webm。
+fn contains_webm(dir: &Path) -> bool {
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_webm(dir, &mut files);
+    !files.is_empty()
 }
 
 fn collect_webm(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -111,7 +118,7 @@ fn collect_webm(dir: &Path, out: &mut Vec<PathBuf>) {
             let p = e.path();
             if p.is_dir() {
                 collect_webm(&p, out);
-            } else if p.extension().map_or(false, |x| x == "webm") {
+            } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("webm")) {
                 out.push(p);
             }
         }

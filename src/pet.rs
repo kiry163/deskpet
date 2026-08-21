@@ -3,7 +3,6 @@
 #![allow(non_snake_case, dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::assets::RoleAssets;
@@ -79,21 +78,18 @@ pub struct Pet {
     last_tick: Instant,
 }
 
-/// 从素材集构建解码器 + 动态分类。
-fn build_from_role(role: &RoleAssets) -> (HashMap<String, ClipDecoder>, Category) {
+/// 从素材集构建解码器 + 动态分类（分类来自管理端动作配置）。
+fn build_from_role(
+    role: &RoleAssets,
+    actions: &HashMap<String, (String, f64, bool)>,
+) -> (HashMap<String, ClipDecoder>, Category) {
     let mut clips: HashMap<String, ClipDecoder> = HashMap::new();
     for (name, wm) in &role.videos {
         if let Some(dec) = ClipDecoder::new(wm.clone()) {
             clips.insert(name.clone(), dec);
         }
     }
-    // 无子目录（flat）时 folder_files 传 None → 走"无子目录"分类分支
-    let folder_files = if role.folder_files.is_empty() {
-        None
-    } else {
-        Some(&role.folder_files)
-    };
-    let cats = state::build_categories(&role.names, role.manifest.as_ref(), folder_files);
+    let cats = state::build_categories_from_actions(&role.names, actions);
     log_info!(
         "动画分类: idle={:?} turn={:?} moves={} clicks={} drag={:?} acts={}",
         cats.idle,
@@ -107,8 +103,13 @@ fn build_from_role(role: &RoleAssets) -> (HashMap<String, ClipDecoder>, Category
 }
 
 impl Pet {
-    pub fn new(win: PetWindow, role: &Rc<RoleAssets>, pc: &PetConfig) -> Pet {
-        let (clips, cats) = build_from_role(role);
+    pub fn new(
+        win: PetWindow,
+        role: &RoleAssets,
+        pc: &PetConfig,
+        actions: &HashMap<String, (String, f64, bool)>,
+    ) -> Pet {
+        let (clips, cats) = build_from_role(role, actions);
         let mut pet = Pet {
             win,
             cats,
@@ -152,8 +153,8 @@ impl Pet {
     }
 
     /// 热替换素材集（导入后 / 角色切换）：重建 clips/cats，重播待机动画，保留窗口与位置。
-    pub fn swap_role(&mut self, role: &Rc<RoleAssets>) {
-        let (clips, cats) = build_from_role(role);
+    pub fn swap_role(&mut self, role: &RoleAssets, actions: &HashMap<String, (String, f64, bool)>) {
+        let (clips, cats) = build_from_role(role, actions);
         self.clips = clips;
         self.cats = cats;
         self.cancel_move();
@@ -165,7 +166,7 @@ impl Pet {
         log_info!("素材已热替换（{} 段动画）", self.clips.len());
     }
 
-    // ---------------- 外部指令（HTTP API，docs/需求规格.md §4.3） ----------------
+    // ---------------- 外部指令（HTTP API，docs/需求规格.md §7） ----------------
 
     /// 入队外部指令（下个 tick 高优先级执行）。
     pub fn enqueue(&mut self, cmd: PetCommand) {

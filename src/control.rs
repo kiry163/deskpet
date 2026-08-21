@@ -1,4 +1,4 @@
-//! 本地 HTTP 控制服务（控制层，见 docs/需求规格.md §5）。
+//! 本地 HTTP 控制服务（控制层，见 docs/需求规格.md §7）。
 //!
 //! 单一通道设计：桌宠进程内嵌 tiny_http，绑定 127.0.0.1，静态托管管理前端 +
 //! `/api/*` JSON API。Agent / 脚本 / 浏览器都通过本服务与桌宠交互（不提供
@@ -8,6 +8,7 @@
 //! `ApiRequest` 经 mpsc 命令通道转交主线程（`App::drain_api`，平台 tick 内排空），
 //! 响应经每请求独立的 reply channel 返回给 HTTP 线程。
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -38,8 +39,24 @@ pub enum ApiOp {
     SetState(Value),
     /// POST /api/pet/say（气泡 + 时长）
     Say { text: String, duration_ms: Option<u64> },
-    /// POST /api/import：素材 zip 已校验并解压落位，通知主线程切换角色并热加载
-    ApplyImport { id: String },
+    /// POST /api/import：素材 zip 已校验并解压落位，通知主线程注册桌宠并热加载
+    ApplyImport { id: String, videos: Vec<String> },
+    /// GET /api/pets：桌宠列表
+    PetsList,
+    /// POST /api/pets/{id}/switch：切换当前桌宠（热生效）
+    SwitchPet { id: String },
+    /// DELETE /api/pets/{id}：删除桌宠（默认保留文件；delete_files=1 连带删除素材目录）
+    DeletePet { id: String, delete_files: bool },
+    /// GET /api/pets/{id}/actions：桌宠动作配置（动画 → 触发类型/权重/启用）
+    GetPetActions { id: String },
+    /// PUT /api/pets/{id}/actions：保存动作配置（热生效）
+    SavePetActions { id: String, actions: Vec<(String, String, f64, bool)> },
+    /// GET /api/settings：程序级配置
+    GetSettings,
+    /// PATCH /api/settings：保存程序级配置（热生效 + 落库）
+    PatchSettings(Value),
+    /// GET /api/system：系统级配置（YAML）+ 版本信息
+    GetSystem,
     /// POST /api/quit
     Quit,
 }
@@ -52,16 +69,13 @@ pub struct ApiRequest {
 
 /// 控制服务句柄（持有服务器，退出时解除阻塞）。
 pub struct ControlServer {
-    /// 实际监听端口（默认 18686，冲突时随机；写入 control.json）。
+    /// 实际监听端口（配置指定，冲突时随机；写入 control.json）。
     #[allow(dead_code)]
     pub port: u16,
     /// 控制台 URL（托盘「打开控制台」用）。
     pub url: String,
     server: Arc<Server>,
 }
-
-/// 默认端口；被占用时回退随机端口（实际端口写 control.json）。
-const DEFAULT_PORT: u16 = 18686;
 
 /// 管理前端未构建时的占位页（web/dist 编译期内嵌后由静态资源替代，见 docs §6.2）。
 /// 内置最小可用功能：素材 zip 导入 + API 自检，便于前端工程落地前联调。
@@ -132,14 +146,15 @@ function show(text, ok) { result.textContent = text; result.className = ok ? 'ok
 </html>"#;
 
 impl ControlServer {
-    /// 启动 HTTP 服务：优先默认端口，冲突回退随机端口；实际端口写
+    /// 启动 HTTP 服务：优先配置端口，冲突回退随机端口；实际端口写
     /// `<配置目录>/control.json`（外部程序据此发现端点）。
     pub fn start(
         app_tx: mpsc::Sender<ApiRequest>,
         config_dir: PathBuf,
         assets_root: PathBuf,
+        preferred_port: u16,
     ) -> Option<ControlServer> {
-        let server = Server::http(("127.0.0.1", DEFAULT_PORT))
+        let server = Server::http(("127.0.0.1", preferred_port))
             .or_else(|_| Server::http(("127.0.0.1", 0)))
             .ok()?;
         let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
@@ -175,49 +190,82 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
         );
         return;
     }
-    let path = req.url().split('?').next().unwrap_or("").to_string();
+    let url = req.url().to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url.clone(), String::new()),
+    };
     let method = req.method().clone();
-    match (method, path.as_str()) {
-        (Method::Get, "/api/state") => dispatch(req, app_tx, ApiOp::State),
-        (Method::Get, "/api/config") => dispatch(req, app_tx, ApiOp::GetConfig),
-        (Method::Patch, "/api/config") => {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    match (method, segs.as_slice()) {
+        (Method::Get, ["api", "state"]) => dispatch(req, app_tx, ApiOp::State),
+        (Method::Get, ["api", "config"]) => dispatch(req, app_tx, ApiOp::GetConfig),
+        (Method::Patch, ["api", "config"]) => {
             let body = read_body(&mut req);
             let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
             dispatch(req, app_tx, ApiOp::PatchConfig(v));
         }
-        (Method::Post, "/api/import") => {
+        (Method::Post, ["api", "import"]) => {
             let body = read_body(&mut req);
             handle_import(req, app_tx, &body, assets_root);
         }
-        (Method::Post, "/api/pet/play") => {
+        (Method::Post, ["api", "pet", "play"]) => {
             let body = read_body(&mut req);
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string();
             dispatch(req, app_tx, ApiOp::Play(action));
         }
-        (Method::Post, "/api/pet/move") => {
+        (Method::Post, ["api", "pet", "move"]) => {
             let body = read_body(&mut req);
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
             let y = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
             dispatch(req, app_tx, ApiOp::MoveTo { x, y });
         }
-        (Method::Post, "/api/pet/set_state") => {
+        (Method::Post, ["api", "pet", "set_state"]) => {
             let body = read_body(&mut req);
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             dispatch(req, app_tx, ApiOp::SetState(v));
         }
-        (Method::Post, "/api/pet/say") => {
+        (Method::Post, ["api", "pet", "say"]) => {
             let body = read_body(&mut req);
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let duration_ms = v.get("duration_ms").and_then(|x| x.as_u64());
             dispatch(req, app_tx, ApiOp::Say { text, duration_ms });
         }
-        (Method::Post, "/api/quit") => dispatch(req, app_tx, ApiOp::Quit),
+        (Method::Get, ["api", "pets"]) => dispatch(req, app_tx, ApiOp::PetsList),
+        (Method::Post, ["api", "pets", id, "switch"]) => {
+            dispatch(req, app_tx, ApiOp::SwitchPet { id: (*id).to_string() });
+        }
+        (Method::Delete, ["api", "pets", id]) => {
+            let q = parse_query(&query);
+            let delete_files = q.get("delete_files").map(|v| v == "1" || v == "true").unwrap_or(false);
+            dispatch(req, app_tx, ApiOp::DeletePet { id: (*id).to_string(), delete_files });
+        }
+        (Method::Get, ["api", "pets", id, "actions"]) => {
+            dispatch(req, app_tx, ApiOp::GetPetActions { id: (*id).to_string() });
+        }
+        (Method::Put, ["api", "pets", id, "actions"]) => {
+            let body = read_body(&mut req);
+            let actions = parse_actions_body(&body);
+            dispatch(req, app_tx, ApiOp::SavePetActions { id: (*id).to_string(), actions });
+        }
+        (Method::Get, ["api", "pets", id, "webm", action]) => {
+            handle_webm(req, assets_root, id, action);
+            return;
+        }
+        (Method::Get, ["api", "settings"]) => dispatch(req, app_tx, ApiOp::GetSettings),
+        (Method::Patch, ["api", "settings"]) => {
+            let body = read_body(&mut req);
+            let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            dispatch(req, app_tx, ApiOp::PatchSettings(v));
+        }
+        (Method::Get, ["api", "system"]) => dispatch(req, app_tx, ApiOp::GetSystem),
+        (Method::Post, ["api", "quit"]) => dispatch(req, app_tx, ApiOp::Quit),
         // 其余 GET 一律交给管理前端处理（内嵌 / 磁盘覆盖 / 404 兜底），
         // 保证 DESKPET_CONSOLE_DIR 下任意路径可访问
-        (Method::Get, path) => serve_console(req, path),
+        (Method::Get, _) => serve_console(req, &path),
         _ => {
             let _ = req.respond(
                 Response::from_string(json!({"ok": false, "error": "not found"}).to_string())
@@ -226,6 +274,25 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
             );
         }
     }
+}
+
+/// 解析 PUT /api/pets/{id}/actions 的 body：`[{action, trigger, weight, enabled}]`。
+fn parse_actions_body(body: &[u8]) -> Vec<(String, String, f64, bool)> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let action = item.get("action")?.as_str()?.to_string();
+            let trigger = item.get("trigger").and_then(|x| x.as_str()).unwrap_or("idle_act").to_string();
+            let weight = item.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            let enabled = item.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+            Some((action, trigger, weight, enabled))
+        })
+        .collect()
 }
 
 /// POST /api/import：素材 zip 上传（裸 body，Content-Type: application/zip）。
@@ -241,7 +308,7 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
         }
         Ok(report) => {
             let (tx, rx) = mpsc::channel::<Value>();
-            let op = ApiOp::ApplyImport { id: report.id.clone() };
+            let op = ApiOp::ApplyImport { id: report.id.clone(), videos: report.videos.clone() };
             if app_tx.send(ApiRequest { op, reply: tx }).is_err() {
                 let _ = req.respond(
                     Response::from_string(json!({"ok": false, "error": "app not ready"}).to_string())
@@ -269,6 +336,81 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
             };
             let _ = req.respond(Response::from_string(resp.to_string()).with_header(json_header()));
         }
+    }
+}
+
+// ---------------- 动画 webm 直出（前端 <video> 播放） ----------------
+
+/// GET /api/pets/{id}/webm/{action}：返回该动画的 webm 文件（video/webm）。
+/// 供控制台前端 <video> 直接播放（浏览器支持 VP9+alpha webm）。
+fn handle_webm(req: Request, assets_root: &Path, pet_id: &str, action_raw: &str) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    if pet_id.contains('/') || pet_id.contains('\\') || pet_id.contains("..") {
+        bad(req, 400, &json!({"ok": false, "error": "invalid pet id"}).to_string());
+        return;
+    }
+    let action = percent_decode(action_raw);
+    if action.is_empty() || action.contains('/') || action.contains('\\') || action.contains("..") {
+        bad(req, 400, &json!({"ok": false, "error": "invalid action"}).to_string());
+        return;
+    }
+    let path = assets_root.join(pet_id).join(format!("{}.webm", action));
+    match std::fs::read(&path) {
+        Ok(bytes) => respond_bytes(req, 200, bytes, "video/webm"),
+        Err(_) => bad(req, 404, &json!({"ok": false, "error": "animation not found"}).to_string()),
+    }
+}
+
+fn respond_bytes(req: Request, code: u32, bytes: Vec<u8>, content_type: &str) {
+    let ct = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
+    let _ = req.respond(Response::from_data(bytes).with_status_code(code).with_header(ct));
+}
+
+/// 解析 URL query：`a=1&b=2` → map（值做百分号解码）。
+fn parse_query(qs: &str) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        m.insert(k.to_string(), percent_decode(v));
+    }
+    m
+}
+
+/// 百分号解码（UTF-8 多字节由 from_utf8_lossy 兜底）。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 1 {
+            let hi = hex_val(b.get(i + 1).copied());
+            let lo = hex_val(b.get(i + 2).copied());
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(c: Option<u8>) -> Option<u8> {
+    match c? {
+        b'0'..=b'9' => Some(c.unwrap() - b'0'),
+        b'a'..=b'f' => Some(c.unwrap() - b'a' + 10),
+        b'A'..=b'F' => Some(c.unwrap() - b'A' + 10),
+        _ => None,
     }
 }
 

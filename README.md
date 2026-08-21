@@ -26,12 +26,13 @@
 - **浏览器控制台**（托盘「打开控制台」→ `http://127.0.0.1:<port>/`，前端编译期内嵌）：
   状态面板 + 指令面板（say 气泡 / play / move / 退出）、zip 素材导入、外观配置（热生效）
 - **zip 素材导入**：控制台导入素材包（校验 → 解压到素材根 → 热加载，不重启）；
-  发布物仅二进制，素材不随包分发（docs/需求规格.md §3）
+  发布物仅二进制，素材不随包分发（docs/需求规格.md §4 桌宠管理·导入）
 - 鼠标悬停桌宠 → 手型光标，提示可交互（点击回应 / 拖拽）——**仅 Windows**（macOS 因逐 tick
   穿透切换，窗口服务器不支持光标样式，悬停手型已放弃）
 - 开机自启：Windows `HKCU\...\Run`；macOS `~/Library/LaunchAgents/com.kiry.deskpet.plist`
-- 配置：Windows `%APPDATA%\deskpet\config.json`；macOS `~/Library/Application Support/deskpet/config.json`
-  （首次运行自动从旧版 Tauri 应用配置迁移）
+- 配置：**单一 YAML（系统级引导）+ SQLite（程序级/桌宠级）**——Windows
+  `%APPDATA%\deskpet\`；macOS `~/Library/Application Support/deskpet/`
+  （首次运行自动生成 `deskpet.yaml` 并建库 `deskpet.db`，无旧版本迁移）
 
 ## 构建
 
@@ -103,27 +104,25 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
 
 ## 配置
 
-`config.json`（路径见上）：
+配置分层（见 docs/需求规格.md §2）：
 
-```json
-{
-  "rx": 0.83,
-  "ry": 0.62,
-  "facing_right": true,
-  "scale": 0.5,
-  "always_on_top": true,
-  "no_move": false,
-  "assets_dir": null,
-  "character": null
-}
-```
+- **系统级**：单一 YAML `deskpet.yaml`（引导级，打开数据库前必须已知）：
 
-`rx/ry` 为工作区内归一化位置（0..1，相对于主屏工作区），`null` 表示右下角默认位。
+  ```yaml
+  database_path: C:/Users/me/AppData/Roaming/deskpet/deskpet.db  # 不存在则自动建库
+  assets_dir: null      # 素材根；null = 默认配置目录 assets/
+  console_port: 18686   # 冲突时回退随机端口
+  log_level: info       # off|error|warn|info|debug
+  ```
+
+  首次运行无 YAML 时自动生成默认文件；可提前放置/手改以指定数据库路径。
+- **程序级**：SQLite `app_settings` —— 当前桌宠、位置（归一化 `rx/ry`）、缩放、置顶、
+  朝向、不移动等，控制台「配置」页修改（热生效并落库）；
+- **桌宠级**：SQLite `pets` + `pet_actions` —— 素材集注册与动作配置（动画 → 触发类型 →
+  权重/启用）。
+
 `autostart` 不持久化在配置中，以注册表/LaunchAgent 为准（避免与系统启动项管理漂移）。
-`assets_dir`（素材根目录，`null` = 自动解析：环境变量 `DESKPET_ASSETS_DIR` > 配置目录
-`assets/` > exe 旁 `assets/` > 当前目录 `assets/`）与 `character`（角色子目录名，
-`null` = 自动检测 `assets/` 下第一个含 `videos/` 或 `manifest.json` 的子目录；
-兼容 `assets/` 本身即角色目录）。配置也可在控制台「配置」页修改（热生效并落盘）。
+`assets_dir` 也可用环境变量 `DESKPET_ASSETS_DIR` 覆盖。
 
 ## 控制台
 
@@ -132,22 +131,24 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
 `web/dist` 缺失时回退内嵌占位页（仍可导入素材）。
 
 - **状态**：当前动作/位置/朝向/缩放/可见性 + 指令面板（say 气泡 / play 动作 / move / 退出）
-- **导入**：拖拽上传素材 zip 包（zip 根 = `manifest.json` + `videos/`），校验 → 解压到
-  素材根 → 热加载（不重启），导入角色自动成为当前角色
-- **配置**：缩放 / 置顶 / 朝向 / 可见性 / 不移动，改动即时生效并写入 config.json
+- **导入**：拖拽上传素材 zip 包（**仅扫描 zip 内全部 webm**，无 manifest/videos 结构要求），
+  校验 → 平铺解压到素材根 → 注册桌宠（动画默认全部进闲时随机池，动作分类在管理端配置）；
+  当前无桌宠时导入自动成为当前桌宠，否则需手动切换（阶段 2）
+- **配置**：缩放 / 置顶 / 朝向 / 可见性 / 不移动，改动即时生效并写入 SQLite
 
 对外 JSON API（Agent / 脚本直接调用）：`GET /api/state`、`GET|PATCH /api/config`、
 `POST /api/pet/{say,play,move,set_state}`、`POST /api/import`、`POST /api/quit`；
-响应统一 `{ok, data?, error?}`，详见 docs/需求规格.md §5。
+响应统一 `{ok, data?, error?}`，详见 docs/需求规格.md §7。
 
 ## 与上游差异
 
 - 裁剪：多角色（外部形象目录）、多桌宠（生成/删除）、右键"播放任意动画"子菜单
-- 配置：改为单宠物结构 + 从旧版 Tauri 应用迁移；位置用归一化 `rx/ry`
+- 配置：单宠物结构 + 归一化 `rx/ry` 位置；数据层为 单一 YAML（系统级引导）+
+  SQLite（程序级 `app_settings` / 桌宠级 `pets`+`pet_actions`），无旧版本迁移
 - 自启注册表值名：`deskpet`（上游为 `dsh-pet-standalone`）
 - 构建：libvpx 链接改为 build.rs 自动探测（`vpx.lib`/`vpxmd.lib`，vcpkg 优先）
 - 素材：与软件分离（exe 不内嵌素材，~1.5MB），运行时从目录加载
-  （`assets_dir`/`character` 配置 + manifest.json 分类 + 子目录/关键词兜底）；
+  （递归扫描 webm，无 manifest；动作分类由管理端配置，存 SQLite）；
   支持自定义素材，见 docs/需求规格.md
 - 架构：平台中立核心（`pet.rs`/`state.rs`/`clip.rs`/`webm.rs`）+ 平台后端
   （`win32.rs` / `macos.rs`）；菜单为数据驱动（`menu.rs`）
