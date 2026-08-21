@@ -83,7 +83,7 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>deskpet 控制台</title>
+<title>DeskPet</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:48px auto;padding:0 24px;color:#333;line-height:1.7}
 code{background:#f4f4f4;padding:2px 6px;border-radius:4px;font-size:.92em}
@@ -98,7 +98,7 @@ pre{background:#f8f8f8;border-radius:6px;padding:10px;overflow:auto;font-size:.8
 </style>
 </head>
 <body>
-<h1>🐱 deskpet 控制台</h1>
+<h1>🐱 DeskPet 控制台</h1>
 <p>管理前端尚未构建（<code>web/dist</code> 缺失，当前为内嵌占位页）。
 构建前端：<code>cd web &amp;&amp; npm install &amp;&amp; npm run build</code> 后页面即内嵌进二进制。
 占位页已内置 <b>素材导入</b> 与 <b>API 自检</b>，可先联调。</p>

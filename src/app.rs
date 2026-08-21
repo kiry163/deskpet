@@ -106,7 +106,7 @@ impl App {
     }
 
     /// 打开系统默认浏览器访问控制台。
-    fn open_console(&self) {
+    pub(crate) fn open_console(&self) {
         match &self.console {
             Some(c) => {
                 log_info!("打开控制台: {}", c.url);

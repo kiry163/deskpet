@@ -17,7 +17,7 @@ export default function App() {
   return (
     <div>
       <header className="topbar">
-        <span className="logo">🐱 桌宠</span>
+        <span className="logo">🐱 DeskPet</span>
         <nav>
           {TABS.map((t) => (
             <button

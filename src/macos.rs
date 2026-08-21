@@ -24,8 +24,8 @@ use objc2_app_kit::{
 };
 use objc2_core_graphics::{CGColorSpace, CGContext, CGImage};
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-    NSTimer,
+    ns_string, MainThreadMarker, NSData, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSTimer,
 };
 
 use crate::app::App;
@@ -563,71 +563,15 @@ pub fn open_url(url: &str) {
 
 // ---------------- 状态栏 / 定时器 / 主循环 ----------------
 
-/// 从当前渲染帧生成状态栏图标（CGImage 独立副本 → NSImage）。
-fn make_status_image(app: &mut App) -> Option<Retained<NSImage>> {
-    let pet = match app.pet.as_mut() {
-        Some(p) => p,
-        // 无素材（未导入）时用默认圆形图标，保证状态栏可点
-        None => return default_status_image(),
-    };
-    let img = pet.win.make_image();
-    if img.is_null() {
-        return None;
-    }
-    let copy = unsafe { CGImageCreateCopy(img) };
-    if copy.is_null() {
-        // img 的 +1 也要释放
-        unsafe { CGImageRelease(img) };
-        return None;
-    }
+/// 状态栏图标：固定使用 resources/deskpet.png（随二进制内嵌，256×256 缩放到 18pt）。
+fn make_status_image() -> Option<Retained<NSImage>> {
     let mtm = MainThreadMarker::new()?;
-    // NSImage 持有传入的 CGImage（会 retain）；释放我们自己创建的 +1 引用
-    let nsimg = unsafe {
-        let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*copy, NSSize::new(32.0, 18.0));
-        CGImageRelease(copy);
-        CGImageRelease(img);
-        nsimg
-    };
-    Some(nsimg)
-}
-
-/// 无素材时的默认状态栏图标（32×18 椭圆，BGRA premultiplied）。
-fn default_status_image() -> Option<Retained<NSImage>> {
-    let mtm = MainThreadMarker::new()?;
-    let (w, h) = (32usize, 18usize);
-    let mut buf = vec![0u8; w * h * 4];
-    for y in 0..h {
-        for x in 0..w {
-            let dx = x as f64 - w as f64 / 2.0;
-            let dy = y as f64 - h as f64 / 2.0;
-            if dx * dx / (13.5 * 13.5) + dy * dy / (7.0 * 7.0) <= 1.0 {
-                let i = (y * w + x) * 4;
-                buf[i] = 0x7f;
-                buf[i + 1] = 0x9c;
-                buf[i + 2] = 0xff;
-                buf[i + 3] = 255;
-            }
-        }
-    }
+    let bytes: &'static [u8] = include_bytes!("../resources/deskpet.png");
     unsafe {
-        let cs = CGColorSpaceCreateDeviceRGB();
-        if cs.is_null() {
-            return None;
-        }
-        let ctx = CGBitmapContextCreate(buf.as_mut_ptr() as *mut c_void, w, h, 8, w * 4, cs, BITMAP_INFO);
-        CGColorSpaceRelease(cs);
-        if ctx.is_null() {
-            return None;
-        }
-        let img = CGBitmapContextCreateImage(ctx);
-        CGContextRelease(ctx);
-        if img.is_null() {
-            return None;
-        }
-        // NSImage 会 retain img；释放我们自己的 +1 引用
-        let nsimg = NSImage::initWithCGImage_size(mtm.alloc(), &*img, NSSize::new(32.0, 18.0));
-        CGImageRelease(img);
-        Some(nsimg)
+        let data = NSData::dataWithBytes_length(bytes.as_ptr() as *const c_void, bytes.len() as usize);
+        let img = NSImage::initWithData(mtm.alloc(), &data)?;
+        img.setSize(NSSize::new(18.0, 18.0));
+        Some(img)
     }
 }
 
@@ -635,10 +579,10 @@ fn setup_status_item(mtm: MainThreadMarker, app: &mut App) {
     let bar = NSStatusBar::systemStatusBar();
     let item = bar.statusItemWithLength(-1.0); // NSStatusItemVariableLength
     if let Some(btn) = item.button(mtm) {
-        if let Some(img) = make_status_image(app) {
+        if let Some(img) = make_status_image() {
             btn.setImage(Some(&img));
         }
-        btn.setToolTip(Some(ns_string!("deskpet 桌宠")));
+        btn.setToolTip(Some(ns_string!("DeskPet")));
     }
     // 完整菜单：桌宠菜单（角落/置顶/不移动/自启/大小）+ 打开控制台/显示隐藏/退出（与 win32 托盘右键一致）
     let mut items = app
