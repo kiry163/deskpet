@@ -480,6 +480,16 @@ impl Pet {
         self.switch_anim(&pick);
     }
 
+    /// 说话气泡同步到平台窗口（仅 Windows；macOS 绘制时直接读 pet.bubble）。
+    /// 窗口层按文本去重，文本未变时不重渲染，无每帧 GDI 开销。
+    #[cfg(windows)]
+    fn sync_bubble(&mut self) {
+        match &self.bubble {
+            Some(b) => self.win.set_bubble(&b.text),
+            None => self.win.clear_bubble(),
+        }
+    }
+
     /// 每 tick（10ms）驱动：帧推进 + 移动插值。
     pub fn on_tick(&mut self) {
         // 外部指令（HTTP API）：高优先级，先于动画推进执行
@@ -492,6 +502,11 @@ impl Pet {
                 self.bubble = None;
             }
         }
+        // 说话气泡同步到平台窗口：
+        // Windows 由窗口层预渲染位图并在 present 时合成，需显式推送/清除；
+        // macOS 绘制时直接读取 pet.bubble，无需同步（见 macos.rs draw_rect）。
+        #[cfg(windows)]
+        self.sync_bubble();
 
         let dt = self.last_tick.elapsed();
         self.last_tick = Instant::now();

@@ -71,6 +71,8 @@ pub struct PetWindow {
     pub alpha: Vec<u8>,
     /// 说话气泡（say API，present 时合成到顶部）。
     pub bubble: Option<BubbleBitmap>,
+    /// 已渲染气泡文本（去重：文本未变时跳过重渲染，避免每 tick 重复 GDI 开销）。
+    bubble_text: Option<String>,
 }
 
 pub const FRAME_TIMER: usize = 1;
@@ -139,6 +141,7 @@ impl PetWindow {
             bits: std::ptr::null_mut(),
             alpha: Vec::new(),
             bubble: None,
+            bubble_text: None,
         };
         pet.resize(1, 1);
         Some(pet)
@@ -286,11 +289,19 @@ impl PetWindow {
     }
 
     /// 设置说话气泡（say API）：GDI 预渲染为位图，present 时合成。
+    /// 文本未变时跳过重渲染（on_tick 每 10ms 同步一次，避免重复 GDI 开销）。
     pub fn set_bubble(&mut self, text: &str) {
-        self.bubble = render_bubble(text);
+        if self.bubble_text.as_deref() == Some(text) {
+            return;
+        }
+        self.bubble_text = Some(text.to_string());
+        // 最大宽度 = 窗口宽度（留 8px 边距），超宽自动逐级缩小字号，保证气泡不被丢弃
+        let max_w = (self.width as usize).saturating_sub(8).max(40);
+        self.bubble = render_bubble(text, max_w);
     }
 
     pub fn clear_bubble(&mut self) {
+        self.bubble_text = None;
         self.bubble = None;
     }
 
@@ -326,14 +337,16 @@ impl Drop for PetWindow {
 }
 
 /// GDI 预渲染说话气泡：圆角白底 + 深色文字 → BGRA premultiplied 位图。
-/// 字体优先微软雅黑（中文），回退系统默认。
-fn render_bubble(text: &str) -> Option<BubbleBitmap> {
+/// 字体优先微软雅黑（中文），回退系统默认；文本超 `max_w` 时逐级缩小字号。
+/// 注意：GDI 的 32bpp BI_RGB DIB 不写 alpha 字节（恒为 0），读回后必须按
+/// 几何圆角矩形掩码重建 alpha，否则 AC_SRC_ALPHA 合成会全部跳过（气泡不显示）。
+fn render_bubble(text: &str, max_w: usize) -> Option<BubbleBitmap> {
     use windows_sys::Win32::Foundation::{RECT, SIZE};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
         DrawTextW, GetStockObject, GetTextExtentPoint32W, RoundRect, SelectObject, SetBkMode,
         SetTextColor, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-        DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, TRANSPARENT,
+        DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_WORDBREAK, FW_NORMAL, TRANSPARENT,
         WHITE_BRUSH,
     };
 
@@ -341,30 +354,66 @@ fn render_bubble(text: &str) -> Option<BubbleBitmap> {
     if hdc.is_null() {
         return None;
     }
-    // 字体：微软雅黑 16px（负值 = 字符高度）
+    let text_w: Vec<u16> = text.encode_utf16().collect();
+    let pad_x = 14i32;
+    let pad_y = 7i32;
+    let max_w = max_w.max(40);
+
+    // 选字号：16px 起，单行放不下则逐级缩小；最小 12px（更长的文本用多行换行兜底，
+    // 避免无限缩小字号或气泡超出窗口被合成阶段丢弃）
     let face: Vec<u16> = "Microsoft YaHei\0".encode_utf16().collect();
-    let font = unsafe {
-        CreateFontW(
-            -16, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0,
-            CLEARTYPE_QUALITY as u32, 0, face.as_ptr(),
-        )
-    };
+    let mut font: *mut std::ffi::c_void = std::ptr::null_mut();
+    for size_px in [16i32, 14, 12] {
+        if !font.is_null() {
+            unsafe { DeleteObject(font as _) };
+            font = std::ptr::null_mut();
+        }
+        let f = unsafe {
+            CreateFontW(
+                -size_px, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0,
+                CLEARTYPE_QUALITY as u32, 0, face.as_ptr(),
+            )
+        };
+        if f.is_null() {
+            continue;
+        }
+        font = f;
+        let old_font = unsafe { SelectObject(hdc, f as _) };
+        let mut sz: SIZE = unsafe { std::mem::zeroed() };
+        unsafe { GetTextExtentPoint32W(hdc, text_w.as_ptr(), text_w.len() as i32, &mut sz) };
+        unsafe { SelectObject(hdc, old_font as _) };
+        if (sz.cx + pad_x * 2) as usize <= max_w {
+            break;
+        }
+    }
     if font.is_null() {
         unsafe { DeleteDC(hdc) };
         return None;
     }
     let old_font = unsafe { SelectObject(hdc, font as _) };
 
-    // 文本尺寸
-    let text_w: Vec<u16> = text.encode_utf16().collect();
-    let mut sz: SIZE = unsafe { std::mem::zeroed() };
-    unsafe { GetTextExtentPoint32W(hdc, text_w.as_ptr(), text_w.len() as i32, &mut sz) };
-    let pad_x = 14i32;
-    let pad_y = 7i32;
-    let bw = (sz.cx + pad_x * 2).max(40) as usize;
-    let bh = (sz.cy + pad_y * 2).max(24) as usize;
+    // 布局：DT_CALCRECT 按可换行宽度计算实际所需尺寸
+    // （短文本 = 单行文字宽度，气泡贴合文字；长文本 = max_w 内多行，高度自适应）
+    let max_line_w = (max_w as i32 - pad_x * 2).max(1);
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: max_line_w,
+        bottom: 0,
+    };
+    unsafe {
+        DrawTextW(
+            hdc,
+            text_w.as_ptr(),
+            text_w.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
+        );
+    }
+    let bw = (rc.right + pad_x * 2).max(40) as usize;
+    let bh = (rc.bottom + pad_y * 2).max(24) as usize;
 
-    // 32bpp 顶向下 DIB（初始全透明）
+    // 32bpp 顶向下 DIB
     let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = bw as i32;
@@ -416,7 +465,7 @@ fn render_bubble(text: &str) -> Option<BubbleBitmap> {
             text_w.as_ptr(),
             text_w.len() as i32,
             &mut rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
         );
         // 读回像素
         let mut buf = vec![0u8; bw * bh * 4];
@@ -426,6 +475,29 @@ fn render_bubble(text: &str) -> Option<BubbleBitmap> {
         DeleteObject(bmp as _);
         DeleteObject(font as _);
         DeleteDC(hdc);
+        // 重建 alpha：GDI 不写 alpha（恒 0），按几何圆角矩形掩码生成
+        // （半径 8，与上方 RoundRect(…,16,16) 一致）；内部 255，角落 0。
+        let r = 8.0f64.min(bw as f64 / 2.0).min(bh as f64 / 2.0);
+        let (w, h) = (bw as f64, bh as f64);
+        let (rx0, ry0) = (r, r);
+        let (rx1, ry1) = (w - r, h - r);
+        for y in 0..bh {
+            for x in 0..bw {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let inside = if px < rx0 && py < ry0 {
+                    (px - rx0).powi(2) + (py - ry0).powi(2) <= r * r
+                } else if px > rx1 && py < ry0 {
+                    (px - rx1).powi(2) + (py - ry0).powi(2) <= r * r
+                } else if px < rx0 && py > ry1 {
+                    (px - rx0).powi(2) + (py - ry1).powi(2) <= r * r
+                } else if px > rx1 && py > ry1 {
+                    (px - rx1).powi(2) + (py - ry1).powi(2) <= r * r
+                } else {
+                    true
+                };
+                buf[(y * bw + x) * 4 + 3] = if inside { 255 } else { 0 };
+            }
+        }
         return Some(BubbleBitmap { buf, w: bw, h: bh });
     }
 }
