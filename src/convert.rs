@@ -53,6 +53,54 @@ impl Default for ConvertOptions {
     }
 }
 
+/// 锚点（宠物级）：跨动画共享归一化基准（见 docs/素材转换与集成方案.md §7.1）。
+/// `scale = target_h / h_ref`（h_ref = 待机站立高度源 px）。
+#[derive(Clone, Copy, Debug)]
+pub struct RefAnchor {
+    pub h_ref: f64,
+    pub source_w: usize,
+    pub source_h: usize,
+}
+
+impl RefAnchor {
+    /// 由参考高度算共享缩放：所有动画乘同一 `scale`，体形严格一致。
+    pub fn scale(&self, target_h: f64) -> f64 {
+        if self.h_ref > 0.0 {
+            target_h / self.h_ref
+        } else {
+            1.0
+        }
+    }
+}
+
+/// 测量参考高度：解码源 mp4，取字符 alpha 包围盒（含 6px 边距）的**高度**作为待机站立高度。
+/// 供「测锚点」用（§7.3 建宠时以待机视频测 `H_ref`，§7.5 分辨率不一致时重测）。
+pub fn measure_ref_height(src: &str, opts: &ConvertOptions) -> Result<RefAnchor, String> {
+    let (w, h, _, _) = probe(src).map_err(|e| e)?;
+    let p = P::from(opts, w, h);
+    let bb = compute_union_bbox(src, w, h, &p).ok_or_else(|| "未检测到角色（全透明）".to_string())?;
+    let (_, y0, _, y1) = pad_bbox(bb, w, h);
+    Ok(RefAnchor { h_ref: (y1 - y0) as f64, source_w: w, source_h: h })
+}
+
+/// 校验源视频可被转码器读取（视频包建宠前的预检）：宽高非 0 且时长 > 0。
+pub fn validate_video(src: &str) -> Result<(), String> {
+    let (w, h, _, duration) = probe(src).map_err(|e| e)?;
+    if w == 0 || h == 0 {
+        return Err("视频宽高为 0".to_string());
+    }
+    if duration <= 0.0 {
+        return Err("视频时长为 0（可能无法解码）".to_string());
+    }
+    Ok(())
+}
+
+/// 读源视频分辨率 `(w, h)`（锚点复用判断：源分辨率 == 锚点则直接复用 scale）。
+pub fn probe_dimensions(src: &str) -> Result<(usize, usize), String> {
+    let (w, h, _, _) = probe(src).map_err(|e| e)?;
+    Ok((w, h))
+}
+
 struct P {
     lo: f32,
     hi: f32,
@@ -126,10 +174,14 @@ fn ffprobe_path() -> String {
 
 /// 转换单段 mp4 → webm。`progress` 回调收到 (0..1 进度, 消息)，用于作业进度上报。
 /// 成功返回输出尺寸 (w, h)。
+///
+/// `force_scale`：跨动画共享归一化基准。`Some(scale)` 时所有动画乘同一个 `scale`
+/// （体形严格一致，见 §3/§7.1 锚点法），否则按每段自带包围盒归一化到 `target_h`。
 pub fn convert_file(
     src: &str,
     dst: &str,
     opts: &ConvertOptions,
+    force_scale: Option<f64>,
     progress: &mut dyn FnMut(f64, &str),
 ) -> Result<(usize, usize), String> {
     let (w, h, fps, duration) = probe(src).map_err(|e| e)?;
@@ -143,16 +195,17 @@ pub fn convert_file(
                 progress(0.05, "未检测到角色（全透明），关闭归一化输出原尺寸");
                 None
             }
-            Some((x0, y0, x1, y1)) => {
-                let x0 = x0.saturating_sub(6);
-                let y0 = y0.saturating_sub(6);
-                let x1 = (x1 + 6).min(w);
-                let y1 = (y1 + 6).min(h);
+            Some(bbox) => {
+                let (x0, y0, x1, y1) = pad_bbox(bbox, w, h);
                 let cw = x1 - x0;
                 let ch = y1 - y0;
-                let scale_f = (opts.target_h / ch as f64) as f32;
+                // 共享缩放：force_scale 时对所有动画一致；否则按本段包围盒归一化到 target_h。
+                let scale_f = match force_scale {
+                    Some(s) => s as f32,
+                    None => (opts.target_h / ch as f64) as f32,
+                };
                 let mut sw = (cw as f32 * scale_f).round() as i64;
-                let sh = opts.target_h as i64;
+                let sh = (ch as f32 * scale_f).round() as i64;
                 if sw % 2 != 0 {
                     sw += 1;
                 }
@@ -320,6 +373,17 @@ fn compute_union_bbox(src: &str, w: usize, h: usize, p: &P) -> Option<(usize, us
     }
     let _ = dec.wait();
     bbox
+}
+
+/// 包围盒加 6px 边距（并裁剪到画布内）。测锚点用其高度，归一化用其作为裁剪范围。
+#[inline]
+fn pad_bbox((x0, y0, x1, y1): (usize, usize, usize, usize), w: usize, h: usize) -> (usize, usize, usize, usize) {
+    (
+        x0.saturating_sub(6),
+        y0.saturating_sub(6),
+        (x1 + 6).min(w),
+        (y1 + 6).min(h),
+    )
 }
 
 /// 单帧 RGB → RGBA（straight alpha）。

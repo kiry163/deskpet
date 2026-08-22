@@ -165,7 +165,7 @@ function StateCard({ s, idx, builtin, update, remove }: {
   )
 }
 
-function setRule(s: StateDef, ri: number, patch: Partial<TimeRule>, set: (fn: (x: StateDef) => StateDef) => void) {
+function setRule(_s: StateDef, ri: number, patch: Partial<TimeRule>, set: (fn: (x: StateDef) => StateDef) => void) {
   set((x) => ({
     ...x,
     time_rules: x.time_rules.map((r, j) => (j === ri ? { ...r, ...patch } : r)),

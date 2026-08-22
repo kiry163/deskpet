@@ -21,13 +21,23 @@ pub struct PetRow {
 }
 
 /// 动作配置行（最终模型：交互 or 状态池）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ActionRow {
     pub action: String,       // key = webm 文件名 stem
     pub display_name: String, // 显示名（用户可编辑）
     pub owner_kind: String,   // 'interactive' | 'state'
     pub kind: Option<String>, // interactive → 'click'/'drag'；state → None
     pub enabled: bool,
+}
+
+/// 宠物锚点（跨动画共享归一化基准）：`scale = TARGET_H / h_ref`。
+#[derive(Clone, Debug)]
+pub struct PetAnchor {
+    pub pet_id: String,
+    pub scale: f64,
+    pub h_ref: f64,
+    pub source_w: i64,
+    pub source_h: i64,
 }
 
 pub struct Db {
@@ -72,6 +82,26 @@ CREATE TABLE IF NOT EXISTS convert_jobs (
   error       TEXT,
   created_at  INTEGER NOT NULL,
   finished_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS pet_anchors (
+  pet_id    TEXT PRIMARY KEY REFERENCES pets(id) ON DELETE CASCADE,
+  scale     REAL NOT NULL,
+  h_ref     REAL NOT NULL,
+  source_w  INTEGER NOT NULL,
+  source_h  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pet_import_jobs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  pet_id         TEXT NOT NULL,
+  pet_name       TEXT,
+  total          INTEGER NOT NULL,
+  done           INTEGER NOT NULL DEFAULT 0,
+  failed         INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL,
+  current_action TEXT,
+  error          TEXT,
+  created_at     INTEGER NOT NULL,
+  finished_at    INTEGER
 );
 CREATE TABLE IF NOT EXISTS app_settings (
   key   TEXT PRIMARY KEY,
@@ -448,6 +478,87 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         Ok(rows)
+    }
+
+    // ---------------- pet_anchors（宠物级归一化锚点） ----------------
+
+    pub fn set_pet_anchor(&self, a: &PetAnchor) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pet_anchors (pet_id, scale, h_ref, source_w, source_h) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![a.pet_id, a.scale, a.h_ref, a.source_w, a.source_h],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn get_pet_anchor(&self, pet_id: &str) -> Result<Option<PetAnchor>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pet_id, scale, h_ref, source_w, source_h FROM pet_anchors WHERE pet_id = ?1")
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query_map(params![pet_id], |r| {
+                Ok(PetAnchor {
+                    pet_id: r.get(0)?,
+                    scale: r.get(1)?,
+                    h_ref: r.get(2)?,
+                    source_w: r.get(3)?,
+                    source_h: r.get(4)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.next().transpose().map_err(db_err)
+    }
+
+    // ---------------- pet_import_jobs（视频包 → 新建整只宠） ----------------
+
+    pub fn insert_pet_import_job(&self, pet_id: &str, pet_name: &str, total: usize) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO pet_import_jobs (pet_id, pet_name, total, status, created_at) VALUES (?1, ?2, ?3, 'running', ?4)",
+                params![pet_id, pet_name, total as i64, now_secs()],
+            )
+            .map_err(db_err)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_pet_import_job(&self, id: i64, status: &str, done: usize, failed: usize, current_action: Option<&str>, error: Option<&str>) -> Result<(), String> {
+        let finished = if status == "done" || status == "error" { Some(now_secs()) } else { None };
+        self.conn
+            .execute(
+                "UPDATE pet_import_jobs SET status=?1, done=?2, failed=?3, current_action=?4, error=?5, finished_at=?6 WHERE id=?7",
+                params![status, done as i64, failed as i64, current_action, error, finished, id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn get_pet_import_job(&self, id: i64) -> Result<serde_json::Value, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, pet_id, pet_name, total, done, failed, status, current_action, error, created_at FROM pet_import_jobs WHERE id = ?1")
+            .map_err(db_err)?;
+        let mut rows = stmt
+            .query_map(params![id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "pet_id": r.get::<_, String>(1)?,
+                    "pet_name": r.get::<_, Option<String>>(2)?,
+                    "total": r.get::<_, i64>(3)?,
+                    "done": r.get::<_, i64>(4)?,
+                    "failed": r.get::<_, i64>(5)?,
+                    "status": r.get::<_, String>(6)?,
+                    "current_action": r.get::<_, Option<String>>(7)?,
+                    "error": r.get::<_, Option<String>>(8)?,
+                    "created_at": r.get::<_, i64>(9)?,
+                }))
+            })
+            .map_err(db_err)?;
+        match rows.next().transpose().map_err(db_err)? {
+            Some(v) => Ok(v),
+            None => Err(format!("作业不存在: {}", id)),
+        }
     }
 }
 

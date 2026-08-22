@@ -12,6 +12,8 @@ assets/frames/
 assets/videos/
 # 本地测试用素材包（控制台导入用，不入库）
 assets/*.zip
+# 源视频素材包（用户本机的工作素材，不入库）
+assets-videos.zip
 
 # ---- 系统 / 编辑器 ----
 .DS_Store

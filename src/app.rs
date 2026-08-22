@@ -232,7 +232,7 @@ impl App {
                 }
                 None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
             },
-            ApiOp::ApplyImport { id, videos, pet_name, idle, actions, action_states } => match self.apply_import(&id, &videos, pet_name.as_deref(), idle.as_deref(), &actions, &action_states) {
+            ApiOp::ApplyImport { id, videos, pet_name, idle, actions, action_states, anchor, full_body } => match self.apply_import(&id, &videos, pet_name.as_deref(), idle.as_deref(), &actions, &action_states, anchor.as_ref(), full_body.as_deref()) {
                 Ok(()) => json!({"ok": true, "data": {"character": id}}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
@@ -261,13 +261,37 @@ impl App {
                 self.convert_progress(job_id, progress);
                 json!({"ok": true})
             }
-            ApiOp::ConvertDone { job_id, pet_id, action, owner, ok, error } => {
-                self.convert_done(job_id, &pet_id, &action, &owner, ok, error);
+            ApiOp::ConvertDone { job_id, pet_id, action, owner, ok, error, anchor } => {
+                self.convert_done(job_id, &pet_id, &action, &owner, ok, error, anchor);
                 json!({"ok": true})
             }
             ApiOp::ConvertJobsList { pet_id } => {
                 json!({"ok": true, "data": self.cfg.db.list_convert_jobs(&pet_id).unwrap_or_default()})
             }
+            ApiOp::SubmitPetVideoImport { pet_id, name, idle, videos } => {
+                match self.submit_pet_video_import(&pet_id, &name, &idle, &videos) {
+                    Ok(job_id) => json!({"ok": true, "data": {"job_id": job_id}}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                }
+            }
+            ApiOp::PetImportProgress { job_id, current_action, done, total, status, error } => {
+                self.pet_import_progress(job_id, &current_action, done, total, &status, error.as_deref());
+                json!({"ok": true})
+            }
+            ApiOp::PetImportDone { job_id, pet_id, name, idle, anchor, actions, ok, error } => {
+                self.pet_import_done(job_id, &pet_id, &name, &idle, &anchor, &actions, ok, error);
+                json!({"ok": true})
+            }
+            ApiOp::PetImportJobStatus { job_id } => {
+                match self.cfg.db.get_pet_import_job(job_id) {
+                    Ok(v) => json!({"ok": true, "data": v}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                }
+            }
+            ApiOp::ExportPetZip { id } => match self.export_pet_desc(&id) {
+                Ok(desc) => json!({"ok": true, "data": desc}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
             ApiOp::SavePetActions { id, actions, action_states } => match self.save_pet_actions(&id, &actions, &action_states) {
                 Ok(()) => json!({"ok": true, "data": {"saved": actions.len()}}),
                 Err(e) => json!({"ok": false, "error": e}),
@@ -344,6 +368,8 @@ impl App {
         idle: Option<&str>,
         manifest_actions: &[crate::db::ActionRow],
         manifest_states: &[(String, String, f64, bool)],
+        manifest_anchor: Option<&crate::db::PetAnchor>,
+        manifest_full_body: Option<&str>,
     ) -> Result<(), String> {
         let display_name = pet_name.filter(|s| !s.is_empty()).unwrap_or(id);
         self.cfg.db.insert_pet(id, display_name, "zip").map_err(|e| e)?;
@@ -365,6 +391,12 @@ impl App {
                 videos.iter().map(|a| (a.clone(), "idle".to_string(), 1.0, true)).collect();
             self.cfg.db.replace_actions(id, &action_rows, &action_states).map_err(|e| e)?;
         }
+        // 锚点（跨动画共享归一化基准）：manifest 提供则写入。
+        if let Some(a) = manifest_anchor {
+            let mut anchor = a.clone();
+            anchor.pet_id = id.to_string();
+            let _ = self.cfg.db.set_pet_anchor(&anchor);
+        }
         // 体型基准 + 全身照：manifest.idle 优先，否则取空闲池第一个动作；
         // 全身照自动从待机动画取一帧（不上传不改），失败不阻断导入（None 容忍）。
         let idle_action = idle
@@ -375,7 +407,7 @@ impl App {
                 self.cfg.sys.assets_dir.as_deref(),
                 &self.cfg.dir,
             );
-            let img = crate::import::generate_full_body(&assets_dir, id, a).ok();
+            let img = manifest_full_body.map(|s| s.to_string()).or_else(|| crate::import::generate_full_body(&assets_dir, id, a).ok());
             let _ = self.cfg.db.set_pet_baseline(id, a, img.as_deref());
         } else {
             let _ = self.cfg.db.set_pet_baseline(id, videos.first().map(String::as_str).unwrap_or(""), None);
@@ -544,6 +576,7 @@ impl App {
     // ---------------- 异步转换作业（mp4 → webm，见 docs/素材转换与集成方案.md §6.2） ----------------
 
     /// 提交 mp4 转换作业：写库（queued）→ 后台线程跑 convert::convert_file → 进度/结果回传主线程。
+    /// 锚点（§7.5）：源分辨率==锚点 → 复用 scale；不一致 → 重测并更新；无锚点 → 测本段并存储。
     fn submit_convert_job(&mut self, pet_id: &str, action: &str, owner: &str, src_path: &str, dest: &str) -> Result<i64, String> {
         let assets_dir = crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
         let pet_dir = assets_dir.join(pet_id);
@@ -551,12 +584,55 @@ impl App {
         let dest_webm = pet_dir.join(format!("{}.webm", dest));
         let job_id = self.cfg.db.insert_convert_job(pet_id, src_path).map_err(|e| e)?;
 
+        let opts = crate::convert::ConvertOptions::default();
+        let existing = self.cfg.db.get_pet_anchor(pet_id).unwrap_or(None);
+        let sw = crate::convert::probe_dimensions(src_path).ok();
+        let (force_scale, new_anchor) = match &existing {
+            Some(a) => {
+                let same_res = sw.map_or(false, |(w, h)| w as i64 == a.source_w && h as i64 == a.source_h);
+                if same_res {
+                    (Some(a.scale), None) // 分辨率一致 → 直接复用
+                } else {
+                    // 分辨率不一致 → 重测锚点（§7.5）
+                    match crate::convert::measure_ref_height(src_path, &opts) {
+                        Ok(r) => {
+                            let scale = r.scale(opts.target_h);
+                            let na = crate::db::PetAnchor {
+                                pet_id: pet_id.to_string(),
+                                scale,
+                                h_ref: r.h_ref,
+                                source_w: sw.map(|(w, _)| w as i64).unwrap_or(a.source_w),
+                                source_h: sw.map(|(_, h)| h as i64).unwrap_or(a.source_h),
+                            };
+                            (Some(scale), Some(na))
+                        }
+                        Err(_) => (None, None),
+                    }
+                }
+            }
+            None => match crate::convert::measure_ref_height(src_path, &opts) {
+                Ok(r) => {
+                    let scale = r.scale(opts.target_h);
+                    let na = crate::db::PetAnchor {
+                        pet_id: pet_id.to_string(),
+                        scale,
+                        h_ref: r.h_ref,
+                        source_w: sw.map(|(w, _)| w as i64).unwrap_or(0),
+                        source_h: sw.map(|(_, h)| h as i64).unwrap_or(0),
+                    };
+                    (Some(scale), Some(na))
+                }
+                Err(_) => (None, None),
+            },
+        };
+
         let tx = self.api_tx.clone();
         let pet_id = pet_id.to_string();
         let action = action.to_string();
         let owner = owner.to_string();
         let src_path = src_path.to_string();
         let dest_webm_str = dest_webm.to_string_lossy().to_string();
+        let anchor = new_anchor.clone();
 
         std::thread::spawn(move || {
             let send = |op: ApiOp| {
@@ -570,7 +646,8 @@ impl App {
             let res = crate::convert::convert_file(
                 &src_path,
                 &dest_webm_str,
-                &Default::default(),
+                &opts,
+                force_scale,
                 &mut |prog, msg| {
                     log_info!("转换作业 {}: {}", job_id, msg);
                     let now = std::time::Instant::now();
@@ -585,11 +662,11 @@ impl App {
             match res {
                 Ok((w, h)) => {
                     send(ApiOp::ConvertProgress { job_id, progress: 1.0 });
-                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: true, error: None });
+                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: true, error: None, anchor });
                     log_info!("转换作业 {} 完成 -> {}x{}: {}", job_id, w, h, dest_webm_str);
                 }
                 Err(e) => {
-                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: false, error: Some(e.clone()) });
+                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: false, error: Some(e.clone()), anchor: None });
                     log_error!("转换作业 {} 失败: {}", job_id, e);
                 }
             }
@@ -604,10 +681,13 @@ impl App {
         let _ = self.cfg.db.update_convert_job(job_id, "running", progress, None);
     }
 
-    /// 转换完成（主线程）：写库 done/error + 注册动作 + （若为当前桌宠热生效）。
-    fn convert_done(&mut self, job_id: i64, pet_id: &str, action: &str, owner: &str, ok: bool, error: Option<String>) {
+    /// 转换完成（主线程）：写库 done/error + 注册动作 + 存锚点 + （若为当前桌宠热生效）。
+    fn convert_done(&mut self, job_id: i64, pet_id: &str, action: &str, owner: &str, ok: bool, error: Option<String>, anchor: Option<crate::db::PetAnchor>) {
         if ok {
             let _ = self.cfg.db.update_convert_job(job_id, "done", 1.0, None);
+            if let Some(a) = anchor {
+                let _ = self.cfg.db.set_pet_anchor(&a);
+            }
             let owner_kind = if owner == "click" || owner == "drag" { "interactive" } else { "state" };
             let kind = if owner_kind == "interactive" { Some(owner.to_string()) } else { None };
             let row = crate::db::ActionRow {
@@ -631,6 +711,172 @@ impl App {
             let _ = self.cfg.db.update_convert_job(job_id, "error", 0.0, error.as_deref());
             log_error!("转换作业 {} 失败: {:?}", job_id, error);
         }
+    }
+
+    // ---------------- 视频包 → 新建整只宠（§7.3，批量异步） ----------------
+
+    /// 提交视频包建宠作业：插入 pet_import_jobs（running）→ 后台线程测锚点/逐段转换/提全身照 → 完成回传。
+    fn submit_pet_video_import(&mut self, pet_id: &str, name: &str, idle: &str, videos: &[(String, String)]) -> Result<i64, String> {
+        let assets_dir = crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        let pet_dir = assets_dir.join(pet_id);
+        if name.trim().is_empty() || idle.trim().is_empty() || videos.is_empty() {
+            return Err("name/idle/videos 均必填".to_string());
+        }
+        let idle_in = videos.iter().any(|(f, a)| a == idle || f == idle);
+        if !idle_in {
+            return Err(format!("指定的待机动作不存在: {}", idle));
+        }
+        for (f, _a) in videos {
+            if !pet_dir.join(format!("{}.src.mp4", f)).is_file() {
+                return Err(format!("源文件缺失: {}.src.mp4", f));
+            }
+        }
+        let job_id = self.cfg.db.insert_pet_import_job(pet_id, name, videos.len()).map_err(|e| e)?;
+
+        let tx = self.api_tx.clone();
+        let pet_id = pet_id.to_string();
+        let idle = idle.to_string();
+        let name = name.to_string();
+        let videos = videos.to_vec();
+        let job = job_id;
+        let assets_dir = assets_dir.clone();
+        let opts = crate::convert::ConvertOptions::default();
+
+        std::thread::spawn(move || {
+            let send = |op: ApiOp| {
+                let (rtx, _rrx) = mpsc::channel::<serde_json::Value>();
+                let _ = tx.send(ApiRequest { op, reply: rtx });
+            };
+            let fail = |err: String| {
+                send(ApiOp::PetImportDone {
+                    job_id: job,
+                    pet_id: pet_id.clone(),
+                    name: name.clone(),
+                    idle: idle.clone(),
+                    anchor: crate::db::PetAnchor { pet_id: pet_id.clone(), scale: 1.0, h_ref: 1.0, source_w: 0, source_h: 0 },
+                    actions: vec![],
+                    ok: false,
+                    error: Some(err),
+                });
+            };
+            // 1. 测锚点：待机源视频站立高度 → 共享 scale。
+            let idle_idx = videos.iter().position(|(f, _a)| f == &idle).unwrap_or(0);
+            let idle_action = videos[idle_idx].1.clone();
+            let idle_src = pet_dir.join(format!("{}.src.mp4", videos[idle_idx].0));
+            let idle_src_str = idle_src.to_string_lossy().to_string();
+            let anchor = match crate::convert::measure_ref_height(&idle_src_str, &opts) {
+                Ok(r) => r,
+                Err(e) => { fail(format!("测锚点失败: {}", e)); return; }
+            };
+            let scale = anchor.scale(opts.target_h);
+            let anchor_row = crate::db::PetAnchor {
+                pet_id: pet_id.clone(),
+                scale,
+                h_ref: anchor.h_ref,
+                source_w: anchor.source_w as i64,
+                source_h: anchor.source_h as i64,
+            };
+            log_info!("建宠 {} 锚点: h_ref={:.0} scale={:.4}", pet_id, anchor.h_ref, scale);
+
+            // 2. 逐段转换（全部用同一 scale）。
+            let total = videos.len();
+            let mut done = 0usize;
+            let mut failed = 0usize;
+            for (f, a) in &videos {
+                send(ApiOp::PetImportProgress { job_id: job, current_action: a.clone(), done, total, status: "running".into(), error: None });
+                let src = pet_dir.join(format!("{}.src.mp4", f));
+                let dst = pet_dir.join(format!("{}.webm", a));
+                let src_str = src.to_string_lossy().to_string();
+                let dst_str = dst.to_string_lossy().to_string();
+                let res = crate::convert::convert_file(&src_str, &dst_str, &opts, Some(scale), &mut |_prog, msg| {
+                    log_info!("建宠 {} 转换 {}: {}", pet_id, a, msg);
+                });
+                match res {
+                    Ok(_) => done += 1,
+                    Err(e) => { failed += 1; log_error!("建宠 {} 转换 {} 失败: {}", pet_id, a, e); }
+                }
+            }
+            // 3. 从转换后的待机 webm 提取全身照（用动作名，而非源文件名）。
+            let fb = crate::import::generate_full_body(&assets_dir, &pet_id, &idle_action);
+            let fb_ok = fb.is_ok();
+            if failed > 0 || !fb_ok {
+                fail(format!("{} 段转换失败; 全身照 {}", failed, if fb_ok { "ok" } else { "失败" }));
+                return;
+            }
+            // 清理源 mp4。
+            for (f, _a) in &videos {
+                let _ = std::fs::remove_file(pet_dir.join(format!("{}.src.mp4", f)));
+            }
+            send(ApiOp::PetImportProgress { job_id: job, current_action: String::new(), done, total, status: "done".into(), error: None });
+            send(ApiOp::PetImportDone {
+                job_id: job,
+                pet_id,
+                name,
+                idle: idle_action,
+                anchor: anchor_row,
+                actions: videos.iter().map(|(_, a)| a.clone()).collect(),
+                ok: true,
+                error: None,
+            });
+        });
+        Ok(job_id)
+    }
+
+    /// 批量建宠进度（主线程）：写库 running。
+    fn pet_import_progress(&mut self, job_id: i64, current_action: &str, done: usize, _total: usize, status: &str, _error: Option<&str>) {
+        let _ = self.cfg.db.update_pet_import_job(job_id, status, done, 0, Some(current_action), _error);
+    }
+
+    /// 批量建宠完成（主线程）：注册宠物 + 存锚点 + 设基线 + 动作默认 state→idle + 热生效。
+    fn pet_import_done(&mut self, job_id: i64, pet_id: &str, name: &str, idle: &str, anchor: &crate::db::PetAnchor, actions: &[String], ok: bool, error: Option<String>) {
+        if !ok {
+            let _ = self.cfg.db.update_pet_import_job(job_id, "error", 0, 1, None, error.as_deref());
+            let assets_dir = crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+            let _ = std::fs::remove_dir_all(assets_dir.join(pet_id));
+            log_error!("视频包建宠失败 {}: {:?}", pet_id, error);
+            return;
+        }
+        if self.cfg.db.get_pet(pet_id).ok().flatten().is_none() {
+            if let Err(e) = self.cfg.db.insert_pet(pet_id, name.trim(), "video") {
+                log_error!("注册宠物失败: {}", e);
+            }
+            let _ = self.cfg.db.set_pet_anchor(anchor);
+            let _ = self.cfg.db.set_pet_baseline(pet_id, idle, Some("fullbody.png"));
+            let action_rows: Vec<crate::db::ActionRow> = actions.iter().map(|a| crate::db::ActionRow {
+                action: a.clone(), display_name: a.clone(), owner_kind: "state".to_string(), kind: None, enabled: true,
+            }).collect();
+            let action_states: Vec<(String, String, f64, bool)> = actions.iter().map(|a| (a.clone(), "idle".to_string(), 1.0, true)).collect();
+            let _ = self.cfg.db.replace_actions(pet_id, &action_rows, &action_states);
+            self.cfg.db.log_import(Some(pet_id), pet_id, "ok", "");
+            if self.cfg.pet.character.is_none() {
+                self.cfg.pet.character = Some(pet_id.to_string());
+                self.cfg.save();
+                let _ = self.reload_assets();
+            }
+        }
+        let _ = self.cfg.db.update_pet_import_job(job_id, "done", actions.len(), 0, None, None);
+        log_info!("视频包建宠完成: {} ({} 动作)", pet_id, actions.len());
+    }
+
+    /// 一键导出宠物 zip（§7.4）：主线程只做 DB 读，返回导出描述（不含字节）；
+    /// zip 组装由 HTTP 线程用 `assets_root` 直接落字节（避免跨线程文件竞态）。
+    fn export_pet_desc(&mut self, id: &str) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let pet = self.cfg.db.get_pet(id).ok().flatten().ok_or_else(|| format!("宠物不存在: {}", id))?;
+        let (idle, _fb) = self.cfg.db.pet_baseline(id).unwrap_or((None, None));
+        let idle = idle.ok_or_else(|| format!("宠物 {} 缺少待机基准", id))?;
+        let anchor = self.cfg.db.get_pet_anchor(id).ok().flatten().ok_or_else(|| format!("宠物 {} 缺少锚点", id))?;
+        let actions = self.cfg.db.list_actions(id).unwrap_or_default();
+        let action_states = self.cfg.db.list_action_states(id).unwrap_or_default();
+        log_info!("组装导出描述: {} ({} 动作)", id, actions.len());
+        Ok(json!({
+            "pet_id": id,
+            "name": pet.display_name,
+            "idle": idle,
+            "anchor": { "scale": anchor.scale, "h_ref": anchor.h_ref, "source_w": anchor.source_w, "source_h": anchor.source_h },
+            "actions": serde_json::to_value(&actions).unwrap_or(json!([])),
+            "action_states": serde_json::to_value(&action_states).unwrap_or(json!([])),
+        }))
     }
 
     fn api_get_system(&self) -> serde_json::Value {

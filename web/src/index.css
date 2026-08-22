@@ -788,3 +788,31 @@ select {
   color: var(--red);
   word-break: break-all;
 }
+
+/* 从视频新建宠物向导 */
+.seg.wrap {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.vz-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+  padding-right: 4px;
+}
+.vz-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.vz-action input {
+  flex: 1;
+  min-width: 0;
+}
+.imp-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}

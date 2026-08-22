@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, ActionItem, ConvertJob, PetInfo, StateDef } from '../api'
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+import { api, ActionItem, ConvertJob, PetImportJob, PetInfo, StateDef } from '../api'
 import { PetImage } from './DashboardPage'
 
 type Owner = 'state' | 'click' | 'drag'
@@ -40,6 +40,18 @@ export default function PetsPage() {
   const [busy, setBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
+  // ---- 从视频新建宠物（§7.3 视频包 → 整只宠） ----
+  const [videoWizard, setVideoWizard] = useState(false)
+  const [vzBusy, setVzBusy] = useState(false)
+  const [vzStaging, setVzStaging] = useState<{ pet_id: string; videos: string[] } | null>(null)
+  const [vzName, setVzName] = useState('')
+  const [vzActions, setVzActions] = useState<Record<string, string>>({})
+  const [vzIdle, setVzIdle] = useState('')
+  const [vzJobId, setVzJobId] = useState<number | null>(null)
+  const [vzJob, setVzJob] = useState<PetImportJob | null>(null)
+  const [vzDrag, setVzDrag] = useState(false)
+  const vzFileRef = useRef<HTMLInputElement>(null)
+
   // ---- 从视频导入动作（mp4 异步转换作业） ----
   const [jobs, setJobs] = useState<ConvertJob[]>([])
   const [impFile, setImpFile] = useState<File | null>(null)
@@ -72,9 +84,10 @@ export default function PetsPage() {
   // 轮询该宠物的转换作业；被跟踪的作业结束（done/error）后重载动作
   useEffect(() => {
     if (!selected) return
+    const sel = selected
     let alive = true
     async function tick() {
-      const r = await api.convertJobs(selected.id)
+      const r = await api.convertJobs(sel.id)
       if (!alive || !r.ok || !r.data) return
       setJobs(r.data)
       const tj = targetJobRef.current
@@ -82,7 +95,7 @@ export default function PetsPage() {
         const job = r.data.find((j) => j.id === tj)
         if (job && (job.status === 'done' || job.status === 'error')) {
           targetJobRef.current = null
-          reloadActions(selected.id)
+          reloadActions(sel.id)
           loadPets()
         }
       }
@@ -159,6 +172,114 @@ export default function PetsPage() {
       flash(false, r.error ?? '导入失败')
     }
     setBusy(false)
+  }
+
+  // ---- 从视频新建宠物 ----
+  async function uploadVideoZip(f: File) {
+    if (!f.name.toLowerCase().endsWith('.zip')) {
+      flash(false, '请选择 .zip 视频包')
+      return
+    }
+    setVzBusy(true)
+    const r = (await api.importPetVideo(f)) as { ok: boolean; data?: { pet_id: string; videos: string[] }; error?: string }
+    if (r.ok && r.data) {
+      const d = r.data
+      const acts: Record<string, string> = {}
+      for (const v of d.videos) acts[v] = v
+      setVzStaging({ pet_id: d.pet_id, videos: d.videos })
+      setVzActions(acts)
+      setVzIdle(d.videos[0] ?? '')
+      setVzName('')
+      setVzJob(null)
+      setVzJobId(null)
+      flash(true, `已解析 ${d.videos.length} 个源视频，请命名并指定待机`)
+    } else {
+      flash(false, r.error ?? '解析失败')
+    }
+    setVzBusy(false)
+  }
+
+  async function startVideoConvert() {
+    if (!vzStaging) return
+    const vids = Object.entries(vzActions)
+      .map(([file, action]) => ({ file, action: action.trim() }))
+      .filter((x) => x.action)
+    if (vids.length === 0) {
+      flash(false, '请至少给一个动作命名')
+      return
+    }
+    if (!vzName.trim()) {
+      flash(false, '请填宠物名')
+      return
+    }
+    if (!vzIdle) {
+      flash(false, '请指定待机动画')
+      return
+    }
+    setVzBusy(true)
+    const r = (await api.petVideoConvert(vzStaging.pet_id, { name: vzName.trim(), idle: vzIdle, videos: vids })) as {
+      ok: boolean
+      data?: { job_id: number }
+      error?: string
+    }
+    setVzBusy(false)
+    if (r.ok && r.data) {
+      setVzJobId(r.data.job_id)
+      setVzJob({
+        id: r.data.job_id,
+        pet_id: vzStaging.pet_id,
+        pet_name: vzName,
+        total: vids.length,
+        done: 0,
+        failed: 0,
+        status: 'running',
+        current_action: '',
+        error: null,
+        created_at: 0,
+      })
+      flash(true, '开始批量建宠…')
+    } else {
+      flash(false, r.error ?? '启动失败')
+    }
+  }
+
+  // 轮询批量建宠作业
+  useEffect(() => {
+    if (!vzJobId) return
+    const jid = vzJobId
+    let alive = true
+    async function tick() {
+      const r = await api.petImportJob(jid)
+      if (!alive) return
+      if (r.ok && r.data) {
+        setVzJob(r.data)
+        if (r.data.status === 'done' || r.data.status === 'error') {
+          setVzJobId(null)
+          if (r.data.status === 'done') {
+            flash(true, `建宠完成：${r.data.pet_id}`)
+            await loadPets()
+            setVideoWizard(false)
+          } else {
+            flash(false, r.data.error ?? '建宠失败')
+          }
+        }
+      }
+    }
+    tick()
+    const t = setInterval(tick, 1500)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [vzJobId, loadPets])
+
+  function exportPet(id: string) {
+    const a = document.createElement('a')
+    a.href = api.exportPetUrl(id)
+    a.download = ''
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
   }
 
   async function doSwitch(id: string) {
@@ -240,6 +361,7 @@ export default function PetsPage() {
                 {!selected.is_current && (
                   <button className="btn sm primary" onClick={() => doSwitch(selected.id)}>设为当前</button>
                 )}
+                <button className="btn sm" onClick={() => exportPet(selected.id)}>⬇ 导出 zip</button>
               </div>
               {editingName !== '' && (
                 <div className="edit-name">
@@ -362,6 +484,9 @@ export default function PetsPage() {
             <button className="btn primary" onClick={() => fileRef.current?.click()} disabled={busy}>
               ＋ 导入宠物
             </button>
+            <button className="btn" onClick={() => setVideoWizard((v) => !v)}>
+              🎬 从视频新建宠物
+            </button>
           </div>
         </div>
 
@@ -426,6 +551,31 @@ export default function PetsPage() {
           }}
         />
       </div>
+
+      {videoWizard && (
+        <VideoImportWizard
+          vzStaging={vzStaging}
+          vzBusy={vzBusy}
+          vzDrag={vzDrag}
+          vzFileRef={vzFileRef}
+          vzName={vzName}
+          vzActions={vzActions}
+          vzIdle={vzIdle}
+          vzJob={vzJob}
+          setVzDrag={setVzDrag}
+          setVzName={setVzName}
+          setVzActions={setVzActions}
+          setVzIdle={setVzIdle}
+          onPickFile={(f) => uploadVideoZip(f)}
+          onStart={startVideoConvert}
+          onCancel={() => {
+            setVideoWizard(false)
+            setVzStaging(null)
+            setVzJob(null)
+            setVzJobId(null)
+          }}
+        />
+      )}
     </>
   )
 }
@@ -556,6 +706,118 @@ function JobRow({ j }: { j: ConvertJob }) {
         </span>
       </div>
       {j.error && <div className="muted small job-error">{j.error}</div>}
+    </div>
+  )
+}
+
+// ---- 从视频新建宠物向导（§7.3） ----
+function VideoImportWizard(props: {
+  vzStaging: { pet_id: string; videos: string[] } | null
+  vzBusy: boolean
+  vzDrag: boolean
+  vzFileRef: RefObject<HTMLInputElement>
+  vzName: string
+  vzActions: Record<string, string>
+  vzIdle: string
+  vzJob: PetImportJob | null
+  setVzDrag: (b: boolean) => void
+  setVzName: (s: string) => void
+  setVzActions: (a: Record<string, string>) => void
+  setVzIdle: (s: string) => void
+  onPickFile: (f: File) => void
+  onStart: () => void
+  onCancel: () => void
+}) {
+  const {
+    vzStaging, vzBusy, vzDrag, vzFileRef, vzName, vzActions, vzIdle, vzJob,
+    setVzDrag, setVzName, setVzActions, setVzIdle, onPickFile, onStart, onCancel,
+  } = props
+
+  return (
+    <div className="card">
+      <div className="section-h">🎬 从视频新建宠物（视频包 → 自动建宠）</div>
+      <div className="muted small" style={{ marginBottom: 12 }}>
+        上传一个只含源视频（.mp4/.mov）的 zip，程序会以共享锚点统一归一化，从待机动画自动提取全身照并注册整只宠物。
+      </div>
+
+      {vzJob ? (
+        <div>
+          <div className="job-row">
+            <div className="job-name">批量建宠 {vzJob.current_action || '…'}</div>
+            <div className="job-progress">
+              <div className="job-bar">
+                <div className="job-fill" style={{ width: `${vzJob.total ? Math.round((vzJob.done / vzJob.total) * 100) : 0}%` }} />
+              </div>
+              <span className={`badge ${vzJob.status === 'done' ? 'green' : vzJob.status === 'error' ? 'red' : 'blue'}`}>
+                <span className="dot" />
+                {vzJob.status === 'running' ? `转换中 ${vzJob.done}/${vzJob.total}` : vzJob.status === 'done' ? '完成' : '失败'}
+              </span>
+            </div>
+          </div>
+          {vzJob.error && <div className="muted small job-error">{vzJob.error}</div>}
+        </div>
+      ) : !vzStaging ? (
+        <>
+          <div
+            className={`empty small dropzone${vzDrag ? ' drag' : ''}`}
+            onClick={() => vzFileRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setVzDrag(true) }}
+            onDragLeave={() => setVzDrag(false)}
+            onDrop={(e) => { e.preventDefault(); setVzDrag(false); const f = e.dataTransfer.files[0]; if (f && !vzBusy) onPickFile(f) }}
+            style={{ padding: 22 }}
+          >
+            {vzBusy ? '正在解析视频包…' : '点击或拖拽视频包 zip 到这里'}
+          </div>
+          <input
+            ref={vzFileRef}
+            type="file"
+            accept=".zip,application/zip"
+            style={{ display: 'none' }}
+            disabled={vzBusy}
+            onChange={(e) => {
+              if (e.target.files?.[0]) onPickFile(e.target.files[0])
+              e.target.value = ''
+            }}
+          />
+          <button className="btn ghost" onClick={onCancel}>取消</button>
+        </>
+      ) : (
+        <div className="import-form" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+          <div className="imp-field">
+            <div className="label">宠物名</div>
+            <input type="text" value={vzName} onChange={(e) => setVzName(e.target.value)} placeholder="如：蓝发女仆" />
+          </div>
+          <div className="imp-field">
+            <div className="label">逐视频动作名（默认=文件名，可改）</div>
+            <div className="vz-actions">
+              {vzStaging.videos.map((file) => (
+                <div key={file} className="vz-action">
+                  <span className="muted small" style={{ width: '40%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {file}
+                  </span>
+                  <input type="text" value={vzActions[file] ?? ''} onChange={(e) => setVzActions({ ...vzActions, [file]: e.target.value })} />
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="imp-field">
+            <div className="label">指定待机动画（体型基准 / 全身照来源）</div>
+            <div className="seg wrap">
+              {vzStaging.videos.map((file) => (
+                <button key={file} className={vzIdle === file ? 'on' : ''} onClick={() => setVzIdle(file)}>
+                  {vzActions[file] || file}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="imp-actions">
+            <button className="btn ghost" onClick={onCancel}>返回</button>
+            <button className="btn primary" disabled={vzBusy || !vzName.trim() || !vzIdle} onClick={onStart}>
+              {vzBusy ? '启动中…' : '开始转换并建宠'}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -108,6 +108,25 @@ export interface ConvertJob {
   created_at: number
 }
 
+export interface PetImportJob {
+  id: number
+  pet_id: string
+  pet_name: string | null
+  total: number
+  done: number
+  failed: number
+  status: 'running' | 'done' | 'error'
+  current_action: string | null
+  error: string | null
+  created_at: number
+}
+
+export interface PetVideoConvertPayload {
+  name: string
+  idle: string
+  videos: { file: string; action: string }[]
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
   const r = await fetch(path, init)
   return r
@@ -185,6 +204,27 @@ export const api = {
 
   /** 该桌宠的转换作业列表与进度 */
   convertJobs: (id: string) => req<ConvertJob[]>(`/api/pets/${encodeURIComponent(id)}/jobs`),
+
+  /** 视频包（仅源视频 zip）上传：校验 + 解压落位，返回 pet_id + 源视频名列表（不入库） */
+  importPetVideo: (file: File) =>
+    fetch('/api/import/pet-video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip' },
+      body: file,
+    }).then((r) => r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))),
+
+  /** 视频包 → 新建整只宠（异步批量建宠），返回 job_id */
+  petVideoConvert: (petId: string, payload: PetVideoConvertPayload) =>
+    req<{ job_id: number }>(
+      `/api/import/pet-video/${encodeURIComponent(petId)}/convert`,
+      jsonInit('POST', payload),
+    ),
+
+  /** 批量建宠作业进度 */
+  petImportJob: (jobId: number) => req<PetImportJob>(`/api/import/jobs/${jobId}`),
+
+  /** 一键导出宠物 zip（严格 §7.2 格式） */
+  exportPetUrl: (id: string) => `/api/pets/${encodeURIComponent(id)}/export`,
 
   settings: () => req<PetConfig>('/api/settings'),
 

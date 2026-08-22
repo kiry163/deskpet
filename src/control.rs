@@ -47,7 +47,40 @@ pub enum ApiOp {
         idle: Option<String>,
         actions: Vec<crate::db::ActionRow>,
         action_states: Vec<(String, String, f64, bool)>,
+        anchor: Option<crate::db::PetAnchor>,
+        full_body: Option<String>,
     },
+    /// POST /api/import/pet-video/{pet_id}/convert：视频包已落位，通知主线程建宠（批量异步）
+    SubmitPetVideoImport {
+        pet_id: String,
+        name: String,
+        idle: String,
+        videos: Vec<(String, String)>, // (src stem, action 名)
+    },
+    /// 批量建宠作业上报进度
+    PetImportProgress {
+        job_id: i64,
+        current_action: String,
+        done: usize,
+        total: usize,
+        status: String,
+        error: Option<String>,
+    },
+    /// 批量建宠作业上报完成（此单子帧完成后注册宠物）
+    PetImportDone {
+        job_id: i64,
+        pet_id: String,
+        name: String,
+        idle: String,
+        anchor: crate::db::PetAnchor,
+        actions: Vec<String>,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// GET /api/import/jobs/{job_id}：单个批量建宠作业进度
+    PetImportJobStatus { job_id: i64 },
+    /// GET /api/pets/{id}/export：一键导出宠物 zip（严格 §7.2 格式）
+    ExportPetZip { id: String },
     /// GET /api/pets：桌宠列表
     PetsList,
     /// POST /api/pets/{id}/switch：切换当前桌宠（热生效）
@@ -65,7 +98,7 @@ pub enum ApiOp {
     /// 转换线程上报进度
     ConvertProgress { job_id: i64, progress: f64 },
     /// 转换线程上报完成
-    ConvertDone { job_id: i64, pet_id: String, action: String, owner: String, ok: bool, error: Option<String> },
+    ConvertDone { job_id: i64, pet_id: String, action: String, owner: String, ok: bool, error: Option<String>, anchor: Option<crate::db::PetAnchor> },
     /// GET /api/pets/{id}/jobs：该宠物转换作业列表与进度
     ConvertJobsList { pet_id: String },
     /// GET /api/settings：程序级配置
@@ -226,6 +259,22 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
             let body = read_body(&mut req);
             handle_import(req, app_tx, &body, assets_root);
         }
+        (Method::Post, ["api", "import", "pet-video"]) => {
+            let body = read_body(&mut req);
+            handle_import_pet_video(req, app_tx, &body, assets_root);
+        }
+        (Method::Post, ["api", "import", "pet-video", pet_id, "convert"]) => {
+            let body = read_body(&mut req);
+            handle_pet_video_convert(req, app_tx, pet_id, &body);
+        }
+        (Method::Get, ["api", "import", "jobs", job_id]) => {
+            let jid: i64 = job_id.parse().unwrap_or(-1);
+            dispatch(req, app_tx, ApiOp::PetImportJobStatus { job_id: jid });
+        }
+        (Method::Get, ["api", "pets", id, "export"]) => {
+            handle_export_pet(req, app_tx, assets_root, id);
+            return;
+        }
         (Method::Post, ["api", "pet", "play"]) => {
             let body = read_body(&mut req);
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -383,6 +432,8 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
                 idle: report.idle.clone(),
                 actions: report.actions.clone(),
                 action_states: report.action_states.clone(),
+                anchor: report.anchor.clone(),
+                full_body: report.full_body.clone(),
             };
             if app_tx.send(ApiRequest { op, reply: tx }).is_err() {
                 let _ = req.respond(
@@ -411,6 +462,123 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
             };
             let _ = req.respond(Response::from_string(resp.to_string()).with_header(json_header()));
         }
+    }
+}
+
+/// POST /api/import/pet-video：视频包（仅 *.mp4/.mov，无 manifest）上传。**只解压落位，不入库**。
+/// 返回 `{ pet_id, videos:[文件名 stem] }`，供控制台逐视频填动作名、指定待机后调 convert。
+fn handle_import_pet_video(req: Request, _app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], assets_root: &Path) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    if body.is_empty() {
+        bad(req, 400, &json!({"ok": false, "error": "empty zip body"}).to_string());
+        return;
+    }
+    match crate::import::import_pet_video_zip(body, assets_root) {
+        Err(e) => {
+            let _ = req.respond(
+                Response::from_string(json!({"ok": false, "error": e}).to_string())
+                    .with_status_code(400)
+                    .with_header(json_header()),
+            );
+        }
+        Ok(r) => {
+            let _ = req.respond(
+                Response::from_string(json!({"ok": true, "data": {"pet_id": r.pet_id, "videos": r.files}}).to_string())
+                    .with_header(json_header()),
+            );
+        }
+    }
+}
+
+/// POST /api/import/pet-video/{pet_id}/convert：body = `{name, idle, videos:[{file, action}]}`。
+/// 启动异步批量建宠作业（测锚点 → 全部同一 scale 转换 → 从待机 webm 提全身照 → 注册）。
+fn handle_pet_video_convert(req: Request, app_tx: &mpsc::Sender<ApiRequest>, pet_id: &str, body: &[u8]) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let idle = v.get("idle").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut videos = Vec::new();
+    if let Some(arr) = v.get("videos").and_then(|x| x.as_array()) {
+        for it in arr {
+            if let (Some(f), Some(a)) = (
+                it.get("file").and_then(|x| x.as_str()),
+                it.get("action").and_then(|x| x.as_str()),
+            ) {
+                if !f.is_empty() && !a.is_empty() {
+                    videos.push((f.to_string(), a.to_string()));
+                }
+            }
+        }
+    }
+    if name.is_empty() || idle.is_empty() || videos.is_empty() {
+        bad(req, 400, &json!({"ok": false, "error": "name/idle/videos 均必填"}).to_string());
+        return;
+    }
+    let (tx, rx) = mpsc::channel::<Value>();
+    if app_tx
+        .send(ApiRequest {
+            op: ApiOp::SubmitPetVideoImport { pet_id: pet_id.to_string(), name, idle, videos },
+            reply: tx,
+        })
+        .is_err()
+    {
+        bad(req, 503, &json!({"ok": false, "error": "app not ready"}).to_string());
+        return;
+    }
+    let resp = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(json!({"ok": false, "error": "timeout"}));
+    let _ = req.respond(Response::from_string(resp.to_string()).with_header(json_header()));
+}
+
+/// GET /api/pets/{id}/export：导出宠物 zip（严格 §7.2 格式）。
+/// 主线程只回导出描述（DB 读），此处用 assets_root 直接组 zip 并回包（无跨线程文件竞态）。
+fn handle_export_pet(req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_root: &Path, pet_id: &str) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    let (tx, rx) = mpsc::channel::<Value>();
+    if app_tx.send(ApiRequest { op: ApiOp::ExportPetZip { id: pet_id.to_string() }, reply: tx }).is_err() {
+        bad(req, 503, &json!({"ok": false, "error": "app not ready"}).to_string());
+        return;
+    }
+    let resp = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(json!({"ok": false, "error": "timeout"}));
+    if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let _ = req.respond(Response::from_string(resp.to_string()).with_status_code(400).with_header(json_header()));
+        return;
+    }
+    let Some(d) = resp.get("data") else {
+        bad(req, 400, &json!({"ok": false, "error": "导出描述缺失"}).to_string());
+        return;
+    };
+    let name = d.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let idle = d.get("idle").and_then(|x| x.as_str()).unwrap_or("");
+    let anchor = match d.get("anchor") {
+        Some(a) => crate::db::PetAnchor {
+            pet_id: pet_id.to_string(),
+            scale: a.get("scale").and_then(|x| x.as_f64()).unwrap_or(1.0),
+            h_ref: a.get("h_ref").and_then(|x| x.as_f64()).unwrap_or(1.0),
+            source_w: a.get("source_w").and_then(|x| x.as_i64()).unwrap_or(0),
+            source_h: a.get("source_h").and_then(|x| x.as_i64()).unwrap_or(0),
+        },
+        None => {
+            bad(req, 400, &json!({"ok": false, "error": "缺少锚点"}).to_string());
+            return;
+        }
+    };
+    let actions: Vec<crate::db::ActionRow> = d.get("actions")
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+    let action_states: Vec<(String, String, f64, bool)> = d.get("action_states")
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+
+    // 在 HTTP 线程组装 zip（避免跨线程文件竞态）。
+    match crate::import::export_pet_zip(assets_root, pet_id, &name, idle, &anchor, &actions, &action_states) {
+        Ok((bytes, filename)) => respond_download(req, bytes, &filename),
+        Err(e) => bad(req, 400, &json!({"ok": false, "error": e}).to_string()),
     }
 }
 
@@ -517,6 +685,43 @@ fn handle_fullbody(req: Request, assets_root: &Path, pet_id: &str) {
 fn respond_bytes(req: Request, code: u32, bytes: Vec<u8>, content_type: &str) {
     let ct = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
     let _ = req.respond(Response::from_data(bytes).with_status_code(code).with_header(ct));
+}
+
+/// 以附件形式回包（export 下载用）：带 Content-Disposition: attachment。
+/// 文件名非 ASCII 时用 RFC 5987 `filename*=`（percent 编码），保障 Header 只含 ASCII 字节。
+fn respond_download(req: Request, bytes: Vec<u8>, filename: &str) {
+    let safe: String = filename
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '/' | '"' | '\n' | '\r'))
+        .collect();
+    let (value, _final_name) = if safe.is_ascii() {
+        (format!("attachment; filename=\"{}\"", safe), safe)
+    } else {
+        let fallback = if safe.ends_with(".zip") {
+            "pet.zip".to_string()
+        } else {
+            "pet".to_string()
+        };
+        // RFC 5987：filename* 用 percent-encoded UTF-8；同时给个 ASCII 兜底 filename。
+        let encoded = percent_encode_utf8(&safe);
+        (format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", fallback, encoded), safe)
+    };
+    let ct = Header::from_bytes(&b"Content-Type"[..], &b"application/zip"[..]).unwrap();
+    let cd = Header::from_bytes(&b"Content-Disposition"[..], value.as_bytes()).unwrap();
+    let _ = req.respond(Response::from_data(bytes).with_status_code(200).with_header(ct).with_header(cd));
+}
+
+/// 把任意（含非 ASCII）字符串百分号编码为 ASCII（RFC 5987 `filename*` 用）。
+fn percent_encode_utf8(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'_' || *b == b'~' {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 /// 解析 URL query：`a=1&b=2` → map（值做百分号解码）。
