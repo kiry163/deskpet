@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, type PetConfig } from '../api'
+import { api, PetConfig, SystemInfo } from '../api'
 
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<PetConfig | null>(null)
+  const [sys, setSys] = useState<SystemInfo | null>(null)
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
   const load = useCallback(async () => {
-    const r = await api.settings()
-    if (r.ok && r.data) setCfg(r.data)
+    const [c, s] = await Promise.all([api.settings(), api.system()])
+    if (c.ok && c.data) setCfg(c.data)
+    if (s.ok && s.data) setSys(s.data)
   }, [])
 
   useEffect(() => {
@@ -31,145 +33,106 @@ export default function SettingsPage() {
 
   if (!cfg) return <div className="card"><p className="muted">加载中…</p></div>
 
-  const pct = (v: number) => Math.round(v * 100)
+  const steps = cfg.scale_steps.length ? cfg.scale_steps : [0.5, 0.72, 0.85, 1.0]
 
   return (
-    <>
-      {msg && <div className={'msg ' + (msg.ok ? 'ok' : 'err')}>{msg.text}</div>}
-
-      <h1 className="page-title">设置</h1>
+    <div>
+      {msg && <div className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
 
       <div className="card">
-        <h2 className="card-title">大小</h2>
-        <div className="scale-group">
-          {(cfg.scale_steps.length ? cfg.scale_steps : [0.5, 0.72, 0.85, 1.0]).map((s) => (
-            <button
-              key={s}
-              className={'scale-btn' + (Math.abs(cfg.scale - s) < 0.02 ? ' active' : '')}
-              onClick={() => patch({ scale: s }, '大小')}
-            >
-              {Math.round(s * 100)}%
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="card">
-        <h2 className="card-title">行为</h2>
-        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-          <div>
-            <div className="label">待机 {pct(cfg.idle_ratio)}%</div>
-            <div className="desc">安静待着的时间占比（转向/动作/移动占其余）</div>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={pct(cfg.idle_ratio)}
-            onChange={(e) => patch({ idle_ratio: Number(e.target.value) / 100 }, '待机占比')}
-          />
-        </div>
-        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-          <div>
-            <div className="label">转身 {pct(cfg.turn_ratio)}%</div>
-            <div className="desc">东张西望、转身的频率（含待机）</div>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={pct(cfg.turn_ratio)}
-            onChange={(e) => patch({ turn_ratio: Number(e.target.value) / 100 }, '转身占比')}
-          />
-        </div>
-        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-          <div>
-            <div className="label">闲时表演 {pct(cfg.act_ratio)}%</div>
-            <div className="desc">做各种小动作的频率（含待机、转身；其余为走动）</div>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={pct(cfg.act_ratio)}
-            onChange={(e) => patch({ act_ratio: Number(e.target.value) / 100 }, '闲时表演占比')}
-          />
-        </div>
-        <div className="set-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-          <div>
-            <div className="label">动作间隔 {cfg.act_interval_ms / 1000} 秒</div>
-            <div className="desc">每个动作结束后停顿多久再继续（0 = 不停顿）</div>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={10000}
-            step={500}
-            value={cfg.act_interval_ms}
-            onChange={(e) => patch({ act_interval_ms: Number(e.target.value) }, '动作间隔')}
-          />
-        </div>
-      </div>
-
-      <div className="card">
-        <h2 className="card-title">其他</h2>
+        <div className="section-h">外观</div>
         <div className="set-row">
           <div>
-            <div className="label">总是在最前面</div>
+            <div className="label">大小</div>
+            <div className="desc">桌宠在屏幕上的缩放比例</div>
+          </div>
+          <div className="scale-group">
+            {steps.map((s) => (
+              <button key={s} className={`scale-btn${Math.abs(cfg.scale - s) < 0.02 ? ' active' : ''}`}
+                onClick={() => patch({ scale: s }, '大小')}>{Math.round(s * 100)}%</button>
+            ))}
+          </div>
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="label">朝向</div>
+            <div className="desc">默认脸朝哪一侧</div>
+          </div>
+          <div className="seg">
+            <button className={cfg.facing_right ? 'on' : ''} onClick={() => patch({ facing_right: true }, '朝向')}>朝右</button>
+            <button className={!cfg.facing_right ? 'on' : ''} onClick={() => patch({ facing_right: false }, '朝向')}>朝左</button>
+          </div>
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="label">总在最前面</div>
             <div className="desc">不会被其他窗口挡住</div>
           </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={cfg.always_on_top}
-              onChange={(e) => patch({ always_on_top: e.target.checked }, '置顶')}
-            />
-            <span className="track" />
-          </label>
+          <Toggle on={cfg.always_on_top} onClick={() => patch({ always_on_top: !cfg.always_on_top }, '置顶')} />
         </div>
         <div className="set-row">
           <div>
             <div className="label">允许它自己走动</div>
             <div className="desc">关闭后它会在原地待着</div>
           </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={!cfg.no_move}
-              onChange={(e) => patch({ no_move: !e.target.checked }, '走动')}
-            />
-            <span className="track" />
-          </label>
-        </div>
-        <div className="set-row">
-          <div>
-            <div className="label">默认朝右</div>
-            <div className="desc">关闭后它默认脸朝左</div>
-          </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={cfg.facing_right}
-              onChange={(e) => patch({ facing_right: e.target.checked }, '朝向')}
-            />
-            <span className="track" />
-          </label>
-        </div>
-        <div className="set-row">
-          <div>
-            <div className="label">暂时隐藏</div>
-            <div className="desc">不显示在桌面上（托盘图标里还能再打开）</div>
-          </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={cfg.visible ?? true}
-              onChange={(e) => patch({ visible: e.target.checked }, '隐藏')}
-            />
-            <span className="track" />
-          </label>
+          <Toggle on={!cfg.no_move} onClick={() => patch({ no_move: !cfg.no_move }, '走动')} />
         </div>
       </div>
-    </>
+
+      <div className="card">
+        <div className="section-h">行为（移动）</div>
+        <div className="muted small" style={{ marginBottom: 12 }}>移动距离与边界的微调；动作间隔在「状态配置」按状态设置</div>
+        <div className="set-row">
+          <div>
+            <div className="label">最小移动距离</div>
+            <div className="desc">自主动作每次移动的最短路径（像素）</div>
+          </div>
+          <input type="number" value={Math.round(cfg.move_min_px)} onChange={(e) => setCfg({ ...cfg, move_min_px: Number(e.target.value) })}
+            onBlur={() => patch({ move_min_px: cfg.move_min_px }, '最小移动')} />
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="label">最大移动距离</div>
+            <div className="desc">自主动作每次移动的最长路径（像素）</div>
+          </div>
+          <input type="number" value={Math.round(cfg.move_max_px)} onChange={(e) => setCfg({ ...cfg, move_max_px: Number(e.target.value) })}
+            onBlur={() => patch({ move_max_px: cfg.move_max_px }, '最大移动')} />
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="label">边界留白</div>
+            <div className="desc">移动时离屏幕边缘留出的间距（像素）</div>
+          </div>
+          <input type="number" value={Math.round(cfg.move_margin_px)} onChange={(e) => setCfg({ ...cfg, move_margin_px: Number(e.target.value) })}
+            onBlur={() => patch({ move_margin_px: cfg.move_margin_px }, '边界留白')} />
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="section-h">视频转换（默认参数）</div>
+        <p className="hint">从「导入动作」上传 mp4 时用。大多数情况不用改。</p>
+        <div className="grid g2">
+          <div><div className="label">输出画布</div><div className="value">640 × 360</div></div>
+          <div><div className="label">去绿边强度</div><div className="value">90</div></div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="section-h">系统级（保存在配置文件）</div>
+        <div className="grid g2">
+          <div><div className="label">版本</div><div className="value">{sys?.version ?? '—'}</div></div>
+          <div><div className="label">端口</div><div className="value">{sys?.port ?? '—'}</div></div>
+          <div><div className="label">控制台端口（配置）</div><div className="value">{sys?.console_port ?? '—'}</div></div>
+          <div><div className="label">日志级别</div><div className="value">{sys?.log_level ?? '—'}</div></div>
+          <div><div className="label">数据库</div><div className="value small">{sys?.db_path ?? '—'}</div></div>
+          <div><div className="label">素材目录</div><div className="value small">{sys?.assets_dir ?? '—'}</div></div>
+          <div><div className="label">配置文件</div><div className="value small">{sys?.yaml_path ?? '—'}</div></div>
+        </div>
+      </div>
+    </div>
   )
+}
+
+function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+  return <span className={`switch${on ? ' on' : ''}`} onClick={onClick} />
 }

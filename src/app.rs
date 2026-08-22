@@ -18,12 +18,25 @@ pub struct App {
     win: Option<crate::platform::PetWindow>,
     /// HTTP 线程 → 主线程的 API 请求队列（平台 tick 内排空）。
     api_rx: Option<mpsc::Receiver<ApiRequest>>,
+    /// 主线程 → 转换线程的回报通道（异步作业更新进度/结果经此回传）。
+    api_tx: mpsc::Sender<ApiRequest>,
     /// 本地控制服务（HTTP：管理前端 + JSON API）。
     pub console: Option<crate::control::ControlServer>,
 }
 
+/// 从数据库构建某宠物的行为池（动作归属 + 状态池权重）。
+fn build_pools_for(
+    db: &crate::db::Db,
+    pet_id: &str,
+    role: &crate::assets::RoleAssets,
+) -> crate::pet::StatePools {
+    let actions = db.list_actions(pet_id).unwrap_or_default();
+    let action_states = db.list_action_states(pet_id).unwrap_or_default();
+    crate::pet::build_pools(&role.names, &actions, &action_states)
+}
+
 impl App {
-    pub fn new(api_rx: mpsc::Receiver<ApiRequest>) -> App {
+    pub fn new(api_rx: mpsc::Receiver<ApiRequest>, api_tx: mpsc::Sender<ApiRequest>) -> App {
         let cfg = Config::load();
         let assets_dir = crate::assets::resolve_assets_dir(cfg.sys.assets_dir.as_deref(), &cfg.dir);
         let role = crate::assets::load(&assets_dir, cfg.pet.character.as_deref());
@@ -35,16 +48,14 @@ impl App {
             quitting: false,
             win: None,
             api_rx: Some(api_rx),
+            api_tx,
             console: None,
         };
         match (win, role) {
             (Some(win), Some(role)) => {
-                let actions = app
-                    .cfg
-                    .db
-                    .actions_map(app.cfg.pet.character.as_deref().unwrap_or(""))
-                    .unwrap_or_default();
-                let mut pet = Pet::new(win, &role, &app.cfg.pet, &actions);
+                let id = app.cfg.pet.character.clone().unwrap_or_default();
+                let pools = build_pools_for(&app.cfg.db, &id, &role);
+                let mut pet = Pet::new(win, &role, &app.cfg.pet, pools, &app.cfg.pet.behavior_states);
                 pet.restore_position(&app.cfg.pet);
                 app.pet = Some(pet);
             }
@@ -64,6 +75,36 @@ impl App {
         if let Some(pet) = &mut self.pet {
             pet.save_position(&mut self.cfg.pet);
             self.cfg.save();
+        }
+    }
+
+    /// 启动补生成全身照：为「已导入但尚无全身照」的宠物从待机动画取一帧。
+    /// 覆盖历史导入（旧二进制未生成全身照）的宠物，保证控制台总能展示全身照。
+    pub fn backfill_full_body_images(&mut self) {
+        let assets_dir = crate::assets::resolve_assets_dir(
+            self.cfg.sys.assets_dir.as_deref(),
+            &self.cfg.dir,
+        );
+        let pets = match self.cfg.db.list_pets() {
+            Ok(p) => p,
+            Err(e) => {
+                log_warn!("读取桌宠列表失败，跳过全身照补生成: {}", e);
+                return;
+            }
+        };
+        for p in pets {
+            let (idle, fb) = self.cfg.db.pet_baseline(&p.id).unwrap_or((None, None));
+            if idle.is_none() || fb.is_some() {
+                continue;
+            }
+            let Some(a) = idle else { continue };
+            match crate::import::generate_full_body(&assets_dir, &p.id, &a) {
+                Ok(img) => {
+                    let _ = self.cfg.db.set_pet_baseline(&p.id, &a, Some(&img));
+                    log_info!("已补生成全身照: {} ({})", p.display_name, p.id);
+                }
+                Err(e) => log_warn!("补生成全身照失败 {}: {}", p.id, e),
+            }
         }
     }
 
@@ -191,7 +232,7 @@ impl App {
                 }
                 None => json!({"ok": false, "error": "桌宠未创建（无素材）"}),
             },
-            ApiOp::ApplyImport { id, videos } => match self.apply_import(&id, &videos) {
+            ApiOp::ApplyImport { id, videos, pet_name, idle, actions, action_states } => match self.apply_import(&id, &videos, pet_name.as_deref(), idle.as_deref(), &actions, &action_states) {
                 Ok(()) => json!({"ok": true, "data": {"character": id}}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
@@ -208,7 +249,26 @@ impl App {
                 Ok(list) => json!({"ok": true, "data": list}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
-            ApiOp::SavePetActions { id, actions } => match self.save_pet_actions(&id, &actions) {
+            ApiOp::UpdatePetName { id, name } => match self.update_pet_name(&id, &name) {
+                Ok(()) => json!({"ok": true, "data": {"name": name}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::SubmitConvertJob { pet_id, action, owner, src_path, dest } => match self.submit_convert_job(&pet_id, &action, &owner, &src_path, &dest) {
+                Ok(job_id) => json!({"ok": true, "data": {"job_id": job_id, "action": action, "owner": owner, "status": "queued"}}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            ApiOp::ConvertProgress { job_id, progress } => {
+                self.convert_progress(job_id, progress);
+                json!({"ok": true})
+            }
+            ApiOp::ConvertDone { job_id, pet_id, action, owner, ok, error } => {
+                self.convert_done(job_id, &pet_id, &action, &owner, ok, error);
+                json!({"ok": true})
+            }
+            ApiOp::ConvertJobsList { pet_id } => {
+                json!({"ok": true, "data": self.cfg.db.list_convert_jobs(&pet_id).unwrap_or_default()})
+            }
+            ApiOp::SavePetActions { id, actions, action_states } => match self.save_pet_actions(&id, &actions, &action_states) {
                 Ok(()) => json!({"ok": true, "data": {"saved": actions.len()}}),
                 Err(e) => json!({"ok": false, "error": e}),
             },
@@ -276,14 +336,50 @@ impl App {
     }
 
     /// 应用导入结果：注册桌宠（DB）→ 默认动作配置 → （仅当前无桌宠时）设为当前并加载。
-    fn apply_import(&mut self, id: &str, videos: &[String]) -> Result<(), String> {
-        self.cfg.db.insert_pet(id, id, "zip").map_err(|e| e)?;
-        // 默认动作配置：全部动画 → 闲时随机池（管理端可改）
-        let actions: Vec<(String, String, f64, bool)> = videos
-            .iter()
-            .map(|a| (a.clone(), crate::state::TRIGGER_IDLE_ACT.to_string(), 1.0, true))
-            .collect();
-        self.cfg.db.replace_actions(id, &actions).map_err(|e| e)?;
+    fn apply_import(
+        &mut self,
+        id: &str,
+        videos: &[String],
+        pet_name: Option<&str>,
+        idle: Option<&str>,
+        manifest_actions: &[crate::db::ActionRow],
+        manifest_states: &[(String, String, f64, bool)],
+    ) -> Result<(), String> {
+        let display_name = pet_name.filter(|s| !s.is_empty()).unwrap_or(id);
+        self.cfg.db.insert_pet(id, display_name, "zip").map_err(|e| e)?;
+        // 有 manifest 动作归属则用之；否则全部动画默认 state → 空闲池
+        if !manifest_actions.is_empty() {
+            self.cfg.db.replace_actions(id, manifest_actions, manifest_states).map_err(|e| e)?;
+        } else {
+            let action_rows: Vec<crate::db::ActionRow> = videos
+                .iter()
+                .map(|a| crate::db::ActionRow {
+                    action: a.clone(),
+                    display_name: a.clone(),
+                    owner_kind: "state".to_string(),
+                    kind: None,
+                    enabled: true,
+                })
+                .collect();
+            let action_states: Vec<(String, String, f64, bool)> =
+                videos.iter().map(|a| (a.clone(), "idle".to_string(), 1.0, true)).collect();
+            self.cfg.db.replace_actions(id, &action_rows, &action_states).map_err(|e| e)?;
+        }
+        // 体型基准 + 全身照：manifest.idle 优先，否则取空闲池第一个动作；
+        // 全身照自动从待机动画取一帧（不上传不改），失败不阻断导入（None 容忍）。
+        let idle_action = idle
+            .map(|s| s.to_string())
+            .or_else(|| crate::import::resolve_idle_from(manifest_actions, manifest_states, videos));
+        if let Some(a) = idle_action.as_deref() {
+            let assets_dir = crate::assets::resolve_assets_dir(
+                self.cfg.sys.assets_dir.as_deref(),
+                &self.cfg.dir,
+            );
+            let img = crate::import::generate_full_body(&assets_dir, id, a).ok();
+            let _ = self.cfg.db.set_pet_baseline(id, a, img.as_deref());
+        } else {
+            let _ = self.cfg.db.set_pet_baseline(id, videos.first().map(String::as_str).unwrap_or(""), None);
+        }
         self.cfg.db.log_import(Some(id), id, "ok", "");
         // 不自动切换：仅当当前无桌宠时设为当前（已有桌宠时由管理端手动切换）
         if self.cfg.pet.character.is_none() {
@@ -301,15 +397,14 @@ impl App {
         let character = self.cfg.pet.character.clone();
         let role = crate::assets::load(&assets_dir, character.as_deref())
             .ok_or_else(|| format!("素材加载失败（{} 下无有效素材集）", assets_dir.display()))?;
-        let actions = match &character {
-            Some(c) => self.cfg.db.actions_map(c).unwrap_or_default(),
-            None => std::collections::HashMap::new(),
-        };
+        let id = character.clone().unwrap_or_default();
+        let states = self.cfg.pet.behavior_states.clone();
+        let pools = build_pools_for(&self.cfg.db, &id, &role);
         match &mut self.pet {
-            Some(pet) => pet.swap_role(&role, &actions),
+            Some(pet) => pet.swap_role(&role, pools, &states),
             None => {
                 let win = self.win.take().ok_or_else(|| "无可用窗口".to_string())?;
-                let mut pet = Pet::new(win, &role, &self.cfg.pet, &actions);
+                let mut pet = Pet::new(win, &role, &self.cfg.pet, pools, &states);
                 pet.restore_position(&self.cfg.pet);
                 self.pet = Some(pet);
             }
@@ -332,6 +427,8 @@ impl App {
             .iter()
             .map(|p| {
                 let video_count = crate::assets::scan_webm_names(&assets_dir.join(&p.id)).len();
+                let (idle_action, full_body_image) =
+                    self.cfg.db.pet_baseline(&p.id).unwrap_or((None, None));
                 json!({
                     "id": p.id,
                     "display_name": p.display_name,
@@ -340,6 +437,9 @@ impl App {
                     "builtin": p.builtin,
                     "video_count": video_count,
                     "is_current": current == Some(p.id.as_str()),
+                    "idle_action": idle_action,
+                    "full_body_image": full_body_image,
+                    "fullbody_url": format!("/api/pets/{}/fullbody", p.id),
                 })
             })
             .collect();
@@ -384,31 +484,153 @@ impl App {
         Ok(())
     }
 
-    /// 桌宠动作配置：动画清单以文件系统为准 + DB 覆盖（未登记默认 idle_act）。
+    /// 桌宠动作配置：动画清单以文件系统为准 + DB 覆盖（未登记默认 state → 空闲池）。
     fn pet_actions(&self, id: &str) -> Result<Vec<serde_json::Value>, String> {
         use serde_json::json;
         let assets_dir =
             crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
         let names = crate::assets::scan_webm_names(&assets_dir.join(id));
-        let map = self.cfg.db.actions_map(id).unwrap_or_default();
+        let rows = self.cfg.db.list_actions(id).unwrap_or_default();
+        let row_of: std::collections::HashMap<&str, &crate::db::ActionRow> =
+            rows.iter().map(|a| (a.action.as_str(), a)).collect();
+        let binds = self.cfg.db.list_action_states(id).unwrap_or_default();
+        let mut bind_of: std::collections::HashMap<&str, Vec<(String, f64, bool)>> =
+            std::collections::HashMap::new();
+        for (action, state_id, weight, enabled) in &binds {
+            bind_of.entry(action.as_str()).or_default().push((state_id.clone(), *weight, *enabled));
+        }
         let mut out = Vec::new();
         for n in names {
-            let (trigger, weight, enabled) = map
-                .get(&n)
-                .cloned()
-                .unwrap_or_else(|| (crate::state::TRIGGER_IDLE_ACT.to_string(), 1.0, true));
-            out.push(json!({"action": n, "trigger": trigger, "weight": weight, "enabled": enabled}));
+            let row = row_of.get(n.as_str()).copied();
+            let states: Vec<serde_json::Value> = bind_of
+                .get(n.as_str())
+                .map(|v| {
+                    v.iter()
+                        .map(|(sid, w, en)| json!({"state_id": sid, "weight": w, "enabled": en}))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(json!({
+                "action": n,
+                "display_name": row.map(|r| r.display_name.clone()).unwrap_or_else(|| n.clone()),
+                "owner_kind": row.map(|r| r.owner_kind.clone()).unwrap_or_else(|| "state".to_string()),
+                "kind": row.and_then(|r| r.kind.clone()),
+                "enabled": row.map(|r| r.enabled).unwrap_or(true),
+                "states": states,
+            }));
         }
         Ok(out)
     }
 
-    fn save_pet_actions(&mut self, id: &str, actions: &[(String, String, f64, bool)]) -> Result<(), String> {
-        self.cfg.db.replace_actions(id, actions).map_err(|e| e)?;
+    fn save_pet_actions(&mut self, id: &str, actions: &[crate::db::ActionRow], action_states: &[(String, String, f64, bool)]) -> Result<(), String> {
+        self.cfg.db.replace_actions(id, actions, action_states).map_err(|e| e)?;
         // 若保存的是当前桌宠 → 热生效
         if self.cfg.pet.character.as_deref() == Some(id) {
             self.reload_assets()?;
         }
         Ok(())
+    }
+
+    /// 编辑桌宠显示名。
+    fn update_pet_name(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("名称不能为空".to_string());
+        }
+        self.cfg.db.update_display_name(id, name).map_err(|e| e)?;
+        Ok(())
+    }
+
+    // ---------------- 异步转换作业（mp4 → webm，见 docs/素材转换与集成方案.md §6.2） ----------------
+
+    /// 提交 mp4 转换作业：写库（queued）→ 后台线程跑 convert::convert_file → 进度/结果回传主线程。
+    fn submit_convert_job(&mut self, pet_id: &str, action: &str, owner: &str, src_path: &str, dest: &str) -> Result<i64, String> {
+        let assets_dir = crate::assets::resolve_assets_dir(self.cfg.sys.assets_dir.as_deref(), &self.cfg.dir);
+        let pet_dir = assets_dir.join(pet_id);
+        let _ = std::fs::create_dir_all(&pet_dir);
+        let dest_webm = pet_dir.join(format!("{}.webm", dest));
+        let job_id = self.cfg.db.insert_convert_job(pet_id, src_path).map_err(|e| e)?;
+
+        let tx = self.api_tx.clone();
+        let pet_id = pet_id.to_string();
+        let action = action.to_string();
+        let owner = owner.to_string();
+        let src_path = src_path.to_string();
+        let dest_webm_str = dest_webm.to_string_lossy().to_string();
+
+        std::thread::spawn(move || {
+            let send = |op: ApiOp| {
+                let (rtx, _rrx) = mpsc::channel::<serde_json::Value>();
+                let _ = tx.send(ApiRequest { op, reply: rtx });
+            };
+            send(ApiOp::ConvertProgress { job_id, progress: 0.0 });
+            let closure_tx = tx.clone();
+            let mut last_prog = -1.0f64;
+            let mut last_t = std::time::Instant::now();
+            let res = crate::convert::convert_file(
+                &src_path,
+                &dest_webm_str,
+                &Default::default(),
+                &mut |prog, msg| {
+                    log_info!("转换作业 {}: {}", job_id, msg);
+                    let now = std::time::Instant::now();
+                    if prog < 1.0 && (prog - last_prog >= 0.02 || last_t.elapsed().as_millis() > 400) {
+                        last_prog = prog;
+                        last_t = now;
+                        let (rtx, _rrx) = mpsc::channel::<serde_json::Value>();
+                        let _ = closure_tx.send(ApiRequest { op: ApiOp::ConvertProgress { job_id, progress: prog }, reply: rtx });
+                    }
+                },
+            );
+            match res {
+                Ok((w, h)) => {
+                    send(ApiOp::ConvertProgress { job_id, progress: 1.0 });
+                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: true, error: None });
+                    log_info!("转换作业 {} 完成 -> {}x{}: {}", job_id, w, h, dest_webm_str);
+                }
+                Err(e) => {
+                    send(ApiOp::ConvertDone { job_id, pet_id, action, owner, ok: false, error: Some(e.clone()) });
+                    log_error!("转换作业 {} 失败: {}", job_id, e);
+                }
+            }
+            // 清理源 mp4（.src.mp4 不参与 webm 扫描）
+            let _ = std::fs::remove_file(&src_path);
+        });
+        Ok(job_id)
+    }
+
+    /// 转换进度回调（主线程）：写库 status=running + progress。
+    fn convert_progress(&self, job_id: i64, progress: f64) {
+        let _ = self.cfg.db.update_convert_job(job_id, "running", progress, None);
+    }
+
+    /// 转换完成（主线程）：写库 done/error + 注册动作 + （若为当前桌宠热生效）。
+    fn convert_done(&mut self, job_id: i64, pet_id: &str, action: &str, owner: &str, ok: bool, error: Option<String>) {
+        if ok {
+            let _ = self.cfg.db.update_convert_job(job_id, "done", 1.0, None);
+            let owner_kind = if owner == "click" || owner == "drag" { "interactive" } else { "state" };
+            let kind = if owner_kind == "interactive" { Some(owner.to_string()) } else { None };
+            let row = crate::db::ActionRow {
+                action: action.to_string(),
+                display_name: action.to_string(),
+                owner_kind: owner_kind.to_string(),
+                kind,
+                enabled: true,
+            };
+            let states: Vec<(String, f64, bool)> = if owner_kind == "state" {
+                vec![("idle".to_string(), 1.0, true)]
+            } else {
+                vec![]
+            };
+            let _ = self.cfg.db.upsert_action(pet_id, &row, &states);
+            if self.cfg.pet.character.as_deref() == Some(pet_id) {
+                let _ = self.reload_assets();
+            }
+            log_info!("转换作业 {} 完成，已注册动作 {} -> {}", job_id, pet_id, action);
+        } else {
+            let _ = self.cfg.db.update_convert_job(job_id, "error", 0.0, error.as_deref());
+            log_error!("转换作业 {} 失败: {:?}", job_id, error);
+        }
     }
 
     fn api_get_system(&self) -> serde_json::Value {
@@ -444,6 +666,7 @@ impl App {
             "data": {
                 "pet": {
                     "anim": pet.cur_anim,
+                    "state_id": pet.current_state,
                     "x": l, "y": t, "w": r - l, "h": b - t,
                     "facing_right": pet.facing_right,
                     "scale": pet.scale,
@@ -506,28 +729,8 @@ impl App {
             }
             applied.push("visible");
         }
-        // 行为引擎参数（阶段 3）
+        // 行为（移动 / 缩放 / 状态集合）
         let mut behavior_changed = false;
-        if let Some(v) = o.get("idle_ratio").and_then(|x| x.as_f64()) {
-            self.cfg.pet.idle_ratio = v;
-            behavior_changed = true;
-            applied.push("idle_ratio");
-        }
-        if let Some(v) = o.get("turn_ratio").and_then(|x| x.as_f64()) {
-            self.cfg.pet.turn_ratio = v;
-            behavior_changed = true;
-            applied.push("turn_ratio");
-        }
-        if let Some(v) = o.get("act_ratio").and_then(|x| x.as_f64()) {
-            self.cfg.pet.act_ratio = v;
-            behavior_changed = true;
-            applied.push("act_ratio");
-        }
-        if let Some(v) = o.get("act_interval_ms").and_then(|x| x.as_u64()) {
-            self.cfg.pet.act_interval_ms = v;
-            behavior_changed = true;
-            applied.push("act_interval_ms");
-        }
         if let Some(v) = o.get("move_min_px").and_then(|x| x.as_f64()) {
             self.cfg.pet.move_min_px = v;
             behavior_changed = true;
@@ -551,17 +754,22 @@ impl App {
                 applied.push("scale_steps");
             }
         }
+        if let Some(v) = o.get("behavior_states").and_then(|x| serde_json::from_value::<Vec<crate::behavior::StateDef>>(x.clone()).ok()) {
+            if !v.is_empty() {
+                self.cfg.pet.behavior_states = v;
+                behavior_changed = true;
+                applied.push("behavior_states");
+            }
+        }
         if behavior_changed {
             self.cfg.pet.normalize_behavior();
             if let Some(p) = &mut self.pet {
                 p.behavior = crate::pet::Behavior::from(&self.cfg.pet);
+                p.states = self.cfg.pet.behavior_states.clone();
             }
             log_info!(
-                "行为参数已更新: idle={} turn={} act={} interval={}ms move={}-{}",
-                self.cfg.pet.idle_ratio,
-                self.cfg.pet.turn_ratio,
-                self.cfg.pet.act_ratio,
-                self.cfg.pet.act_interval_ms,
+                "行为参数已更新: 状态集合={} move={}-{}",
+                self.cfg.pet.behavior_states.len(),
                 self.cfg.pet.move_min_px,
                 self.cfg.pet.move_max_px,
             );

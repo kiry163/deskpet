@@ -21,18 +21,22 @@ pub struct ClipDecoder {
     ytab: [i32; 256],
 }
 
+/// 预计算 YUV→RGB 有限范围 BT.601 亮度系数表（供合成器复用）。
+pub fn make_ytab() -> [i32; 256] {
+    let mut ytab = [0i32; 256];
+    for i in 0..256usize {
+        let y = (i as i32 - 16).max(0);
+        ytab[i] = (298 * y) >> 8;
+    }
+    ytab
+}
+
 impl ClipDecoder {
     pub fn new(webm: Rc<WebM>) -> Option<ClipDecoder> {
-        // 预计算 YUV->RGB 有限范围 BT.601 亮度系数
-        let mut ytab = [0i32; 256];
-        for i in 0..256usize {
-            let y = (i as i32 - 16).max(0);
-            ytab[i] = (298 * y) >> 8;
-        }
         Some(ClipDecoder {
             webm,
             cur: 0,
-            ytab,
+            ytab: make_ytab(),
         })
     }
 
@@ -146,4 +150,63 @@ fn compose_into(color: &vpx_image_t, alpha: Option<&vpx_image_t>, ytab: &[i32; 2
             out[o + 3] = a;
         }
     }
+}
+
+/// 合成 I420 主色 + 可选 alpha → **直通 RGBA**（非预乘，供 PNG 输出/缩略图用），
+/// 写入复用缓冲 out。返回实际像素 (w, h)。颜色算法与 compose_into 相同，仅输出
+/// 直通 alpha（不做预乘、通道序为 RGBA），避免 PNG 预览出现暗边。
+pub fn compose_rgba_into(
+    color: &vpx_image_t,
+    alpha: Option<&vpx_image_t>,
+    ytab: &[i32; 256],
+    out: &mut Vec<u8>,
+) -> (usize, usize) {
+    let w = color.d_w as usize;
+    let h = color.d_h as usize;
+    out.resize(w * h * 4, 0);
+
+    let yp = color.planes[VPX_PLANE_Y];
+    let up = color.planes[VPX_PLANE_U];
+    let vp = color.planes[VPX_PLANE_V];
+    let ys = color.stride[VPX_PLANE_Y] as usize;
+    let us = color.stride[VPX_PLANE_U] as usize;
+    let vs = color.stride[VPX_PLANE_V] as usize;
+    let csx = color.x_chroma_shift as usize;
+    let csy = color.y_chroma_shift as usize;
+
+    let (ap, as_): (*const u8, usize) = match alpha {
+        Some(a) => {
+            if a.planes[VPX_PLANE_ALPHA].is_null() {
+                (a.planes[VPX_PLANE_Y], a.stride[VPX_PLANE_Y] as usize)
+            } else {
+                (a.planes[VPX_PLANE_ALPHA], a.stride[VPX_PLANE_ALPHA] as usize)
+            }
+        }
+        None => (std::ptr::null(), 0),
+    };
+    let has_alpha = alpha.is_some();
+
+    for y in 0..h {
+        let row_off = y * w * 4;
+        let y_row = y * ys;
+        let u_row = (y >> csy) * us;
+        let v_row = (y >> csy) * vs;
+        let a_row = if has_alpha { y * as_ } else { 0 };
+        for x in 0..w {
+            let yv = unsafe { *yp.add(y_row + x) } as usize;
+            let u = unsafe { *up.add(u_row + (x >> csx)) } as usize;
+            let v = unsafe { *vp.add(v_row + (x >> csx)) } as usize;
+            let base = ytab[yv];
+            let r = (base + ((409 * (v as i32 - 128) + 128) >> 8)).clamp(0, 255) as u8;
+            let g = (base - ((100 * (u as i32 - 128) + 128) >> 8) - ((208 * (v as i32 - 128) + 128) >> 8)).clamp(0, 255) as u8;
+            let b = (base + ((516 * (u as i32 - 128) + 128) >> 8)).clamp(0, 255) as u8;
+            let a = if has_alpha { unsafe { *ap.add(a_row + x) } } else { 255 };
+            let o = row_off + x * 4;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+            out[o + 3] = a;
+        }
+    }
+    (w, h)
 }

@@ -136,9 +136,10 @@ macOS `~/Library/Application Support/deskpet/logs/`）。单文件超过 1MB 自
   当前无桌宠时导入自动成为当前桌宠，否则需手动切换（阶段 2）
 - **配置**：缩放 / 置顶 / 朝向 / 可见性 / 不移动，改动即时生效并写入 SQLite
 
-对外 JSON API（Agent / 脚本直接调用）：`GET /api/state`、`GET|PATCH /api/config`、
-`POST /api/pet/{say,play,move,set_state}`、`POST /api/import`、`POST /api/quit`；
-响应统一 `{ok, data?, error?}`，详见 docs/需求规格.md §7。
+对外 JSON API：**外部 Agent / 脚本用 `/agent/*`**（能力 + 只读状态）：`GET /agent/state`、
+`POST /agent/{play,say,move}`；**控制台内部用 `/api/*`**（管理 + 素材工作台）：`GET|PATCH /api/config`、
+`/api/pets*`、`/api/settings`、`/api/system`、`/api/import`、`/api/quit`；
+`set_state` 不再对外（状态由引擎内部维护）。响应统一 `{ok, data?, error?}`，详见 docs/需求规格.md §7。
 
 ## 与上游差异
 

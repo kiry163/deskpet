@@ -8,6 +8,7 @@ export interface ApiResp<T = unknown> {
 
 export interface PetState {
   anim: string | null
+  state_id: string | null
   x: number
   y: number
   w: number
@@ -19,6 +20,27 @@ export interface PetState {
   topmost: boolean
 }
 
+export interface TimeRule {
+  start: string
+  end: string
+  enter: 'instant' | 'next_window'
+  exit: 'at_end' | 'next_window'
+}
+
+export interface IntervalMs {
+  min_ms: number
+  max_ms: number
+}
+
+export interface StateDef {
+  id: string
+  name: string
+  enabled: boolean
+  weight: number
+  time_rules: TimeRule[]
+  interval: IntervalMs
+}
+
 export interface PetConfig {
   rx: number | null
   ry: number | null
@@ -27,17 +49,13 @@ export interface PetConfig {
   always_on_top: boolean
   no_move: boolean
   character: string | null
-  /** PATCH 支持但 GET 不返回（运行时字段） */
-  visible?: boolean
-  // 行为引擎参数
-  idle_ratio: number
-  turn_ratio: number
-  act_ratio: number
-  act_interval_ms: number
+  behavior_states: StateDef[]
   move_min_px: number
   move_max_px: number
   move_margin_px: number
   scale_steps: number[]
+  /** PATCH 支持但 GET 不返回（运行时字段） */
+  visible?: boolean
 }
 
 export interface PetInfo {
@@ -48,13 +66,24 @@ export interface PetInfo {
   builtin: boolean
   video_count: number
   is_current: boolean
+  idle_action: string | null
+  full_body_image: string | null
+  fullbody_url: string
 }
 
-export interface ActionRow {
-  action: string
-  trigger: string
+export interface ActionState {
+  state_id: string
   weight: number
   enabled: boolean
+}
+
+export interface ActionItem {
+  action: string
+  display_name: string
+  owner_kind: 'state' | 'interactive'
+  kind: string | null // interactive → 'click' | 'drag'
+  enabled: boolean
+  states: ActionState[]
 }
 
 export interface SystemInfo {
@@ -70,18 +99,13 @@ export interface SystemInfo {
   log_level: string | null
 }
 
-/** 动画播放场合（与后端 trigger 对齐）。 */
-export const TRIGGERS = [
-  { id: 'idle', label: '待机时' },
-  { id: 'turn', label: '转身时' },
-  { id: 'move', label: '移动时' },
-  { id: 'click', label: '点击它时' },
-  { id: 'drag', label: '被拖拽时' },
-  { id: 'idle_act', label: '其他时候' },
-]
-
-export function triggerLabel(id: string): string {
-  return TRIGGERS.find((t) => t.id === id)?.label ?? id
+export interface ConvertJob {
+  id: number
+  src: string
+  status: 'queued' | 'running' | 'done' | 'error'
+  progress: number
+  error: string | null
+  created_at: number
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
@@ -120,9 +144,13 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/zip' },
       body: file,
-    }).then((r) => r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))),
+    }).then((r) =>
+      r
+        .json()
+        .catch(() => ({ ok: false, error: 'HTTP ' + r.status })),
+    ),
 
-  // ---- 阶段 2：桌宠管理 / 设置 / 系统 ----
+  // ---- 桌宠管理 / 状态配置 / 设置 / 系统 ----
 
   pets: () => req<PetInfo[]>('/api/pets'),
 
@@ -133,14 +161,30 @@ export const api = {
       method: 'DELETE',
     }),
 
-  petActions: (id: string) => req<ActionRow[]>(`/api/pets/${encodeURIComponent(id)}/actions`),
+  updatePetName: (id: string, name: string) =>
+    req<{ name: string }>(`/api/pets/${encodeURIComponent(id)}/name`, jsonInit('PUT', { name })),
 
-  savePetActions: (id: string, actions: ActionRow[]) =>
+  petActions: (id: string) => req<ActionItem[]>(`/api/pets/${encodeURIComponent(id)}/actions`),
+
+  savePetActions: (id: string, actions: ActionItem[]) =>
     req<{ saved: number }>(`/api/pets/${encodeURIComponent(id)}/actions`, jsonInit('PUT', actions)),
 
   /** 动画 webm 文件 URL（前端 <video> 直接播放） */
   webmUrl: (id: string, action: string) =>
     `/api/pets/${encodeURIComponent(id)}/webm/${encodeURIComponent(action)}`,
+
+  /** 全身照 URL（导入时自动从待机动画取帧） */
+  fullbodyUrl: (id: string) => `/api/pets/${encodeURIComponent(id)}/fullbody`,
+
+  /** 提交 mp4 绿幕转换作业（异步） */
+  importVideo: (id: string, action: string, owner: string, file: File) =>
+    fetch(
+      `/api/pets/${encodeURIComponent(id)}/import/video?action=${encodeURIComponent(action)}&owner=${encodeURIComponent(owner)}`,
+      { method: 'POST', headers: { 'Content-Type': 'video/mp4' }, body: file },
+    ).then((r) => r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))),
+
+  /** 该桌宠的转换作业列表与进度 */
+  convertJobs: (id: string) => req<ConvertJob[]>(`/api/pets/${encodeURIComponent(id)}/jobs`),
 
   settings: () => req<PetConfig>('/api/settings'),
 

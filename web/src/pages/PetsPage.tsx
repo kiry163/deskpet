@@ -1,59 +1,54 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, TRIGGERS, type ActionRow, type PetInfo } from '../api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { api, ActionItem, ConvertJob, PetInfo, StateDef } from '../api'
+import { PetImage } from './DashboardPage'
 
-/** 桌宠卡片：展示其形象动画（待机或第一个动画）。 */
-function PetCard({ pet, onSwitch, onDelete, onOpen }: {
-  pet: PetInfo
-  onSwitch: (id: string) => void
-  onDelete: (p: PetInfo) => void
-  onOpen: (id: string) => void
-}) {
-  const [url, setUrl] = useState<string | null>(null)
-  useEffect(() => {
-    let alive = true
-    api.petActions(pet.id).then((r) => {
-      if (!alive || !r.ok || !r.data) return
-      const idle = r.data.find((a) => a.trigger === 'idle' && a.enabled) ?? r.data.find((a) => a.enabled) ?? r.data[0]
-      if (idle) setUrl(api.webmUrl(pet.id, idle.action))
-    })
-    return () => {
-      alive = false
-    }
-  }, [pet.id])
+type Owner = 'state' | 'click' | 'drag'
 
-  return (
-    <div className={'pet-card' + (pet.is_current ? ' current' : '')} onClick={() => onOpen(pet.id)}>
-      {url ? <video src={url} autoPlay loop muted playsInline /> : <div className="muted" style={{ height: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>加载中…</div>}
-      <h3>
-        <span>{pet.display_name}</span>
-        {pet.is_current && <span className="pill on">当前</span>}
-      </h3>
-      <div className="meta">{pet.video_count} 个动画</div>
-      <div className="btns" onClick={(e) => e.stopPropagation()}>
-        {!pet.is_current && (
-          <button className="btn small primary" onClick={() => onSwitch(pet.id)}>
-            设为当前
-          </button>
-        )}
-        <button className="btn small danger" onClick={() => onDelete(pet)}>
-          删除
-        </button>
-      </div>
-    </div>
-  )
+interface Binding {
+  weight: number
+  enabled: boolean
+}
+
+interface EditAction {
+  action: string
+  display_name: string
+  owner: Owner
+  enabled: boolean
+  bindings: Record<string, Binding>
+}
+
+const OWNER_LABEL: Record<Owner, string> = { state: '按时段', click: '点击', drag: '拖拽' }
+
+function toEdit(a: ActionItem): EditAction {
+  const owner: Owner = a.owner_kind === 'interactive' ? (a.kind === 'click' ? 'click' : 'drag') : 'state'
+  const bindings: Record<string, Binding> = {}
+  for (const st of a.states) bindings[st.state_id] = { weight: st.weight, enabled: st.enabled }
+  return { action: a.action, display_name: a.display_name, owner, enabled: a.enabled, bindings }
 }
 
 export default function PetsPage() {
   const [pets, setPets] = useState<PetInfo[] | null>(null)
   const [selected, setSelected] = useState<PetInfo | null>(null)
-  const [actions, setActions] = useState<ActionRow[]>([])
+  const [states, setStates] = useState<StateDef[]>([])
+  const [actions, setActions] = useState<EditAction[]>([])
+  const [view, setView] = useState<'grid' | 'list'>('grid')
   const [dirty, setDirty] = useState(false)
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const [editingName, setEditingName] = useState('')
 
-  // 导入
   const [drag, setDrag] = useState(false)
   const [busy, setBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  // ---- 从视频导入动作（mp4 异步转换作业） ----
+  const [jobs, setJobs] = useState<ConvertJob[]>([])
+  const [impFile, setImpFile] = useState<File | null>(null)
+  const [impName, setImpName] = useState('')
+  const [impOwner, setImpOwner] = useState<Owner>('state')
+  const [impBusy, setImpBusy] = useState(false)
+  const [impDrag, setImpDrag] = useState(false)
+  const impFileRef = useRef<HTMLInputElement>(null)
+  const targetJobRef = useRef<number | null>(null)
 
   const flash = (ok: boolean, text: string) => {
     setMsg({ ok, text })
@@ -68,22 +63,86 @@ export default function PetsPage() {
     }
   }, [])
 
+  // 重载当前宠物的动作列表（转换完成/导入后用）
+  const reloadActions = useCallback(async (id: string) => {
+    const r = await api.petActions(id)
+    if (r.ok && r.data) setActions(r.data.map(toEdit))
+  }, [])
+
+  // 轮询该宠物的转换作业；被跟踪的作业结束（done/error）后重载动作
+  useEffect(() => {
+    if (!selected) return
+    let alive = true
+    async function tick() {
+      const r = await api.convertJobs(selected.id)
+      if (!alive || !r.ok || !r.data) return
+      setJobs(r.data)
+      const tj = targetJobRef.current
+      if (tj != null) {
+        const job = r.data.find((j) => j.id === tj)
+        if (job && (job.status === 'done' || job.status === 'error')) {
+          targetJobRef.current = null
+          reloadActions(selected.id)
+          loadPets()
+        }
+      }
+    }
+    tick()
+    const t = setInterval(tick, 1200)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [selected?.id, reloadActions, loadPets])
+
+  async function submitVideo() {
+    if (!selected || !impFile) return
+    const action = impName.trim()
+    if (!action) {
+      flash(false, '请填写动作名')
+      return
+    }
+    setImpBusy(true)
+    const r = (await api.importVideo(selected.id, action, impOwner, impFile)) as {
+      ok: boolean
+      data?: { job_id: number; action: string; owner: string }
+      error?: string
+    }
+    setImpBusy(false)
+    if (r.ok && r.data) {
+      targetJobRef.current = r.data.job_id
+      flash(true, `已提交转换作业 #${r.data.job_id}，完成会自动注册为动作「${r.data.action}」`)
+      setImpFile(null)
+      setImpName('')
+    } else {
+      flash(false, r.error ?? '提交失败')
+    }
+  }
+
+  function pickImpFile(f: File) {
+    setImpFile(f)
+    if (!impName.trim()) {
+      setImpName(f.name.replace(/\.(mp4|mov)$/i, ''))
+    }
+  }
+
   useEffect(() => {
     loadPets()
+    api.config().then((r) => {
+      if (r.ok && r.data) setStates(r.data.behavior_states)
+    })
   }, [loadPets])
 
-  // 打开桌宠详情 → 加载动作配置
-  const openPet = useCallback(async (id: string) => {
-    const r = await api.petActions(id)
-    if (r.ok && r.data) setActions(r.data)
-    setSelected(pets?.find((p) => p.id === id) ?? null)
-    setDirty(false)
-  }, [pets])
-
-  useEffect(() => {
-    if (selected && actions.length === 0) openPet(selected.id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected])
+  const openPet = useCallback(
+    async (id: string) => {
+      const [acts] = await Promise.all([api.petActions(id)])
+      if (acts.ok && acts.data) setActions(acts.data.map(toEdit))
+      setSelected(pets?.find((p) => p.id === id) ?? null)
+      setDirty(false)
+      setEditingName('')
+    },
+    [pets],
+  )
 
   async function upload(f: File) {
     if (!f.name.toLowerCase().endsWith('.zip')) {
@@ -91,55 +150,71 @@ export default function PetsPage() {
       return
     }
     setBusy(true)
-    try {
-      const r = (await api.importZip(f)) as { ok: boolean; data?: { videos: number; id: string }; error?: string }
-      if (r.ok && r.data) {
-        flash(true, `添加成功：${r.data.videos} 个动画`)
-        await loadPets()
-      } else {
-        flash(false, r.error ?? '添加失败')
-      }
-    } catch (e) {
-      flash(false, `出错了：${e}`)
+    const r = (await api.importZip(f)) as { ok: boolean; data?: { videos: number; id: string; display_name: string }; error?: string }
+    if (r.ok && r.data) {
+      flash(true, `导入成功：${r.data.display_name}，${r.data.videos} 个动作`)
+      setSelected(null)
+      await loadPets()
+    } else {
+      flash(false, r.error ?? '导入失败')
     }
     setBusy(false)
   }
 
   async function doSwitch(id: string) {
     const r = await api.switchPet(id)
-    if (r.ok) {
-      flash(true, '已切换，现在桌面上的就是它啦')
-      await loadPets()
-    } else {
-      flash(false, r.error ?? '切换失败')
-    }
+    flash(r.ok, r.ok ? '已切换为当前桌宠' : r.error ?? '切换失败')
+    await loadPets()
   }
 
   async function doDelete(p: PetInfo) {
-    if (!confirm(`确定删除「${p.display_name}」？\n\n只会把它从列表移除，素材文件会保留。`)) return
-    const r = await api.deletePet(p.id)
+    const withFiles = confirm(`确定删除「${p.display_name}」？`)
+    if (!withFiles) return
+    const r = await api.deletePet(p.id, true)
     if (r.ok) {
       flash(true, '已删除')
-      if (selected?.id === p.id) {
-        setSelected(null)
-        setActions([])
-      }
+      if (selected?.id === p.id) setSelected(null)
       await loadPets()
     } else {
       flash(false, r.error ?? '删除失败')
     }
   }
 
-  function updateAction(idx: number, patch: Partial<ActionRow>) {
-    setActions((as) => as.map((a, i) => (i === idx ? { ...a, ...patch } : a)))
+  async function doRename() {
+    if (!selected || !editingName.trim()) return
+    const r = await api.updatePetName(selected.id, editingName.trim())
+    if (r.ok) {
+      flash(true, '名称已更新')
+      setEditingName('')
+      await loadPets()
+    } else {
+      flash(false, r.error ?? '更新失败')
+    }
+  }
+
+  const patchAction = (idx: number, fn: (a: EditAction) => EditAction) => {
+    setActions((as) => as.map((a, i) => (i === idx ? fn(a) : a)))
     setDirty(true)
   }
 
   async function saveActions() {
     if (!selected) return
-    const r = await api.savePetActions(selected.id, actions)
+    const payload: ActionItem[] = actions.map((a) => ({
+      action: a.action,
+      display_name: a.display_name,
+      owner_kind: a.owner === 'state' ? 'state' : 'interactive',
+      kind: a.owner === 'state' ? null : a.owner,
+      enabled: a.enabled,
+      states:
+        a.owner === 'state'
+          ? Object.entries(a.bindings)
+              .filter(([, b]) => b.enabled)
+              .map(([state_id, b]) => ({ state_id, weight: b.weight, enabled: true }))
+          : [],
+    }))
+    const r = await api.savePetActions(selected.id, payload)
     if (r.ok) {
-      flash(true, '已保存')
+      flash(true, '动作配置已保存')
       setDirty(false)
       await loadPets()
     } else {
@@ -147,152 +222,199 @@ export default function PetsPage() {
     }
   }
 
-  // 按场景分组（禁用动画归入「暂不播放」）
-  const groups = TRIGGERS.map((t) => ({
-    ...t,
-    items: actions.filter((a) => a.enabled && a.trigger === t.id),
-  }))
-  const disabled = actions.filter((a) => !a.enabled)
-
+  // ---------- 详情视图：宠物信息 + 动作管理 ----------
   if (selected) {
     return (
       <>
-        {msg && <div className={'msg ' + (msg.ok ? 'ok' : 'err')}>{msg.text}</div>}
-        <button className="btn small" onClick={() => setSelected(null)} style={{ marginBottom: 14 }}>
-          ← 返回
-        </button>
-        <div className="card">
-          <h2 className="card-title">
-            {selected.display_name} 的动画
-            <span className="muted" style={{ fontWeight: 400 }}>共 {actions.length} 个</span>
-          </h2>
+        {msg && <div className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
+        <button className="btn ghost" onClick={() => setSelected(null)}>← 返回宠物列表</button>
 
-          {groups.map((g) => (
-            <div className="act-group" key={g.id}>
-              <div className="group-head">
-                <span>{g.label}</span>
-                <span className="count">{g.items.length} 个</span>
+        <div className="card">
+          <div className="detail-head">
+            <PetImage pet={selected} className="detail-ph" />
+            <div className="detail-info">
+              <div className="cp-name">{selected.display_name}</div>
+              <div className="muted small">全身照自动取自待机动画（不可改）· 待机：{selected.idle_action ?? '—'}</div>
+              <div className="detail-actions">
+                <button className="btn sm" onClick={() => setEditingName(selected.display_name)}>✎ 编辑名称</button>
+                {!selected.is_current && (
+                  <button className="btn sm primary" onClick={() => doSwitch(selected.id)}>设为当前</button>
+                )}
               </div>
-              {g.items.length === 0 && (
-                <div className="act-row muted" style={{ fontStyle: 'italic' }}>
-                  还没有动画，可把下方动画的「什么时候播放」选到这里
+              {editingName !== '' && (
+                <div className="edit-name">
+                  <input type="text" value={editingName} onChange={(e) => setEditingName(e.target.value)} />
+                  <button className="btn primary sm" onClick={doRename}>保存</button>
+                  <button className="btn sm" onClick={() => setEditingName('')}>取消</button>
                 </div>
               )}
-              {g.items.map((a, i) => {
-                const idx = actions.indexOf(a)
-                return (
-                  <div className="act-row" key={a.action}>
-                    <span className="name" title={a.action}>{a.action}</span>
-                    <select
-                      className="occ"
-                      value={a.trigger}
-                      onChange={(e) => updateAction(idx, { trigger: e.target.value })}
-                    >
-                      {TRIGGERS.map((t) => (
-                        <option key={t.id} value={t.id}>{t.label}</option>
-                      ))}
-                    </select>
-                    <div className="freq">
-                      <input
-                        type="range"
-                        min={0}
-                        max={10}
-                        step={1}
-                        value={a.weight}
-                        onChange={(e) => {
-                          const w = Number(e.target.value)
-                          updateAction(idx, { weight: w, enabled: w > 0 })
-                        }}
-                      />
-                      <span style={{ width: 52 }}>{a.weight > 0 ? `${a.weight} 级` : '不播放'}</span>
-                    </div>
-                  </div>
-                )
-              })}
             </div>
-          ))}
+          </div>
+        </div>
 
-          {disabled.length > 0 && (
-            <div className="act-group">
-              <div className="group-head">
-                <span>暂不播放</span>
-                <span className="count">{disabled.length} 个</span>
-              </div>
-              {disabled.map((a) => {
-                const idx = actions.indexOf(a)
-                return (
-                  <div className="act-row off" key={a.action}>
-                    <span className="name" title={a.action}>{a.action}</span>
-                    <select
-                      className="occ"
-                      value={a.trigger}
-                      onChange={(e) => updateAction(idx, { trigger: e.target.value })}
-                    >
-                      {TRIGGERS.map((t) => (
-                        <option key={t.id} value={t.id}>{t.label}</option>
-                      ))}
-                    </select>
-                    <div className="freq">
-                      <input
-                        type="range"
-                        min={0}
-                        max={10}
-                        step={1}
-                        value={0}
-                        onChange={(e) => {
-                          const w = Number(e.target.value)
-                          updateAction(idx, { weight: w, enabled: w > 0 })
-                        }}
-                      />
-                      <span style={{ width: 52 }}>不播放</span>
-                    </div>
-                  </div>
-                )
-              })}
+        <div className="card">
+          <div className="block-head">
+            <div className="section-h" style={{ margin: 0 }}>动作管理</div>
+            <div className="seg">
+              <button className={view === 'grid' ? 'on' : ''} onClick={() => setView('grid')}>▦ 网格</button>
+              <button className={view === 'list' ? 'on' : ''} onClick={() => setView('list')}>☰ 列表</button>
+            </div>
+          </div>
+          <div className="muted small" style={{ marginBottom: 14 }}>
+            动作可同时归入多个状态；每个状态的出现概率单独设置；点击/拖拽属于交互，不绑定状态。
+          </div>
+
+          {actions.length === 0 ? (
+            <div className="empty">这只宠物还没有动作</div>
+          ) : view === 'grid' ? (
+            <div className="act-grid">
+              {actions.map((a, i) => (
+                <ActionCard key={a.action} a={a} idx={i} states={states} onChange={patchAction} petId={selected.id} />
+              ))}
+            </div>
+          ) : (
+            <div className="act-list">
+              {actions.map((a, i) => (
+                <ActionRowItem key={a.action} a={a} idx={i} states={states} onChange={patchAction} petId={selected.id} />
+              ))}
             </div>
           )}
 
-          <div className="row" style={{ marginTop: 16, marginBottom: 0 }}>
+          <div className="save-row">
             <button className="btn primary" disabled={!dirty} onClick={saveActions}>
               保存{dirty ? '（有修改）' : ''}
             </button>
-            {!dirty && <span className="muted">改一改上面的选项再保存</span>}
+            {!dirty && <span className="muted small">改一改上面的归属、状态或概率再保存</span>}
           </div>
+        </div>
+
+        {/* 从视频导入动作：mp4 绿幕 → 自动转 webm（异步） */}
+        <div className="card">
+          <div className="section-h">＋ 导入动作（mp4 绿幕 → 自动转 webm）</div>
+          <div className="muted small" style={{ marginBottom: 12 }}>
+            上传一个绿幕 mp4，程序自动抠像 / 去绿边 / 归一化转成可用 webm 并注册为动作（异步，可看进度）。
+          </div>
+          <div
+            className={`empty small dropzone${impDrag ? ' drag' : ''}`}
+            onClick={() => impFileRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setImpDrag(true) }}
+            onDragLeave={() => setImpDrag(false)}
+            onDrop={(e) => { e.preventDefault(); setImpDrag(false); const f = e.dataTransfer.files[0]; if (f) pickImpFile(f) }}
+            style={{ padding: 22 }}
+          >
+            {impFile ? `已选择：${impFile.name}` : '点击或拖拽 mp4 绿幕视频到这里'}
+          </div>
+          <input
+            ref={impFileRef}
+            type="file"
+            accept="video/mp4,.mp4"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              if (e.target.files?.[0]) pickImpFile(e.target.files[0])
+              e.target.value = ''
+            }}
+          />
+          <div className="import-form">
+            <div className="imp-field">
+              <div className="label">动作名</div>
+              <input type="text" value={impName} onChange={(e) => setImpName(e.target.value)} placeholder="如：开心蹦跳" />
+            </div>
+            <div className="imp-field">
+              <div className="label">归属</div>
+              <div className="seg">
+                {(Object.keys(OWNER_LABEL) as Owner[]).map((o) => (
+                  <button key={o} className={impOwner === o ? 'on' : ''} onClick={() => setImpOwner(o)}>{OWNER_LABEL[o]}</button>
+                ))}
+              </div>
+            </div>
+            <button className="btn primary" disabled={!impFile || !impName.trim() || impBusy} onClick={submitVideo}>
+              {impBusy ? '提交中…' : '开始转换并入队'}
+            </button>
+          </div>
+          {jobs.length > 0 && (
+            <div className="jobs">
+              <div className="label">转换作业</div>
+              {jobs.map((j) => <JobRow key={j.id} j={j} />)}
+            </div>
+          )}
         </div>
       </>
     )
   }
 
+  // ---------- 列表视图 ----------
+  const list = pets ?? []
   return (
     <>
-      {msg && <div className={'msg ' + (msg.ok ? 'ok' : 'err')}>{msg.text}</div>}
-
-      <h1 className="page-title">我的桌宠</h1>
+      {msg && <div className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
 
       <div className="card">
-        <div className="pet-grid">
-          {pets?.map((p) => (
-            <PetCard key={p.id} pet={p} onSwitch={doSwitch} onDelete={doDelete} onOpen={openPet} />
-          ))}
-          <div
-            className={'add-pet' + (drag ? ' drag' : '') + (busy ? ' busy' : '')}
-            onClick={() => !busy && fileRef.current?.click()}
-            onDragOver={(e) => {
-              e.preventDefault()
-              setDrag(true)
-            }}
-            onDragLeave={() => setDrag(false)}
-            onDrop={(e) => {
-              e.preventDefault()
-              setDrag(false)
-              if (!busy && e.dataTransfer.files[0]) upload(e.dataTransfer.files[0])
-            }}
-          >
-            <span className="plus">＋</span>
-            <span>{busy ? '正在添加…' : '添加新桌宠'}</span>
-            <span className="muted" style={{ fontSize: 12 }}>选择一个 zip 素材包</span>
+        <div className="block-head">
+          <div>
+            <div style={{ fontWeight: 600 }}>我的宠物</div>
+            <div className="muted small">点击某只宠物进入它的动作管理；或从 zip 导入一只</div>
+          </div>
+          <div className="import-actions">
+            <div className="seg">
+              <button className={view === 'grid' ? 'on' : ''} onClick={() => setView('grid')}>▦ 网格</button>
+              <button className={view === 'list' ? 'on' : ''} onClick={() => setView('list')}>☰ 列表</button>
+            </div>
+            <button className="btn primary" onClick={() => fileRef.current?.click()} disabled={busy}>
+              ＋ 导入宠物
+            </button>
           </div>
         </div>
+
+        {list.length === 0 ? (
+          <div
+            className={`empty dropzone${drag ? ' drag' : ''}`}
+            onClick={() => !busy && fileRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setDrag(true) }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={(e) => { e.preventDefault(); setDrag(false); if (!busy && e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]) }}
+          >
+            <div style={{ fontSize: 34 }}>📦</div>
+            <div style={{ fontWeight: 600 }}>{busy ? '正在导入…' : '还没有宠物'}</div>
+            <div className="muted small">点击或拖拽一个 zip 素材包到这里</div>
+          </div>
+        ) : view === 'grid' ? (
+          <div className="pet-grid">
+            {list.map((p) => (
+              <div key={p.id} className={`pet${p.is_current ? ' current' : ''}`} onClick={() => openPet(p.id)}>
+                <PetImage pet={p} className="pet-cover" />
+                <div className="pet-name">
+                  {p.display_name}
+                  {p.is_current && <span className="badge green"><span className="dot" />当前</span>}
+                </div>
+                <div className="small muted">{p.video_count} 个动作</div>
+                <div className="pet-btns" onClick={(e) => e.stopPropagation()}>
+                  {!p.is_current && <button className="btn sm primary" onClick={() => doSwitch(p.id)}>设为当前</button>}
+                  <button className="btn sm danger" onClick={() => doDelete(p)}>删除</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="pet-list">
+            {list.map((p) => (
+              <div key={p.id} className={`row${p.is_current ? ' current' : ''}`} onClick={() => openPet(p.id)}>
+                <PetImage pet={p} className="row-ph" />
+                <div style={{ flex: 1 }}>
+                  <div className="pet-name">
+                    {p.display_name}
+                    {p.is_current && <span className="badge green"><span className="dot" />当前</span>}
+                  </div>
+                  <div className="small muted">{p.video_count} 个动作 · 待机：{p.idle_action ?? '—'}</div>
+                </div>
+                <div className="pet-btns" onClick={(e) => e.stopPropagation()}>
+                  {!p.is_current && <button className="btn sm primary" onClick={() => doSwitch(p.id)}>设为当前</button>}
+                  <button className="btn sm danger" onClick={() => doDelete(p)}>删除</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         <input
           ref={fileRef}
           type="file"
@@ -303,10 +425,137 @@ export default function PetsPage() {
             e.target.value = ''
           }}
         />
-        <p className="muted" style={{ marginTop: 16, marginBottom: 0 }}>
-          点击桌宠卡片，可以为它的每个动画安排「什么时候播放」和「出现频率」。
-        </p>
       </div>
     </>
+  )
+}
+
+function ActionCard({ a, idx, states, onChange, petId }: {
+  a: EditAction; idx: number; states: StateDef[]; onChange: (i: number, fn: (a: EditAction) => EditAction) => void; petId: string
+}) {
+  return (
+    <div className={`act${!a.enabled ? ' off' : ''}`}>
+      <video src={api.webmUrl(petId, a.action)} loop muted playsInline />
+      <div className="body">
+        <input
+          className="act-name"
+          type="text"
+          value={a.display_name}
+          onChange={(e) => onChange(idx, (x) => ({ ...x, display_name: e.target.value }))}
+        />
+        <OwnerPicker a={a} onChange={(owner) => onChange(idx, (x) => ({ ...x, owner }))} />
+        {a.owner === 'state' && <StatePicker a={a} states={states} onChange={(bindings) => onChange(idx, (x) => ({ ...x, bindings }))} />}
+        <div className="act-foot">
+          <span className="muted small">启用</span>
+          <Toggle
+            on={a.enabled}
+            onClick={() => onChange(idx, (x) => ({ ...x, enabled: !x.enabled }))}
+          />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ActionRowItem({ a, idx, states, onChange, petId }: {
+  a: EditAction; idx: number; states: StateDef[]; onChange: (i: number, fn: (a: EditAction) => EditAction) => void; petId: string
+}) {
+  return (
+    <div className="act-table-row">
+      <div className="act-thumb">
+        <video src={api.webmUrl(petId, a.action)} loop muted playsInline />
+      </div>
+      <div className="act-col">
+        <input className="act-name" type="text" value={a.display_name}
+          onChange={(e) => onChange(idx, (x) => ({ ...x, display_name: e.target.value }))} />
+      </div>
+      <div className="act-col"><OwnerPicker a={a} onChange={(owner) => onChange(idx, (x) => ({ ...x, owner }))} /></div>
+      {a.owner === 'state' && (
+        <div className="act-col wide">
+          <StatePicker a={a} states={states} compact onChange={(bindings) => onChange(idx, (x) => ({ ...x, bindings }))} />
+        </div>
+      )}
+      <div className="act-col">
+        <Toggle on={a.enabled} onClick={() => onChange(idx, (x) => ({ ...x, enabled: !x.enabled }))} />
+      </div>
+    </div>
+  )
+}
+
+function OwnerPicker({ a, onChange }: { a: EditAction; onChange: (o: Owner) => void }) {
+  return (
+    <div className="seg">
+      {(Object.keys(OWNER_LABEL) as Owner[]).map((o) => (
+        <button key={o} className={a.owner === o ? 'on' : ''} onClick={() => onChange(o)}>{OWNER_LABEL[o]}</button>
+      ))}
+    </div>
+  )
+}
+
+function StatePicker({ a, states, onChange, compact }: {
+  a: EditAction; states: StateDef[]; onChange: (b: Record<string, Binding>) => void; compact?: boolean
+}) {
+  const enabledStates = states.filter((s) => s.enabled)
+  if (enabledStates.length === 0) return <div className="muted small">（暂无可用状态）</div>
+
+  const picked = enabledStates.filter((s) => a.bindings[s.id]?.enabled)
+
+  function toggleState(id: string) {
+    const b = { ...a.bindings }
+    const cur = b[id]
+    b[id] = cur ? { ...cur, enabled: !cur.enabled } : { weight: 1, enabled: true }
+    onChange(b)
+  }
+  function setWeight(id: string, weight: number) {
+    onChange({ ...a.bindings, [id]: { weight, enabled: true } })
+  }
+
+  return (
+    <div className="st-pick">
+      <div className="label">所属状态（可多选）</div>
+      <div className="st-checks">
+        {enabledStates.map((s) => (
+          <label className="chk" key={s.id}>
+            <input type="checkbox" checked={!!a.bindings[s.id]?.enabled} onChange={() => toggleState(s.id)} />
+            {s.name}
+          </label>
+        ))}
+      </div>
+      {picked.length > 0 && (
+        <div className="st-weights">
+          {picked.map((s) => (
+            <div className="st-p" key={s.id}>
+              <span>{s.name}</span>
+              <input type="range" min={0} max={100} value={Math.round((a.bindings[s.id]?.weight ?? 1) * 100)}
+                onChange={(e) => setWeight(s.id, Number(e.target.value) / 100)} />
+              <b>{Math.round((a.bindings[s.id]?.weight ?? 1) * 100)}%</b>
+            </div>
+          ))}
+        </div>
+      )}
+      {!compact && <div className="muted small">未勾选的状态即不出现在该状态下</div>}
+    </div>
+  )
+}
+
+function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+  return <span className={`switch${on ? ' on' : ''}`} onClick={onClick} />
+}
+
+function JobRow({ j }: { j: ConvertJob }) {
+  const action = j.src.split('/').pop()?.replace(/\.src\.mp4$/i, '') ?? `作业#${j.id}`
+  const label = { queued: '排队中', running: '转换中', done: '完成', error: '失败' }[j.status] ?? j.status
+  const pct = Math.round((j.progress ?? 0) * 100)
+  return (
+    <div className="job-row">
+      <div className="job-name">{action}</div>
+      <div className="job-progress">
+        <div className="job-bar"><div className="job-fill" style={{ width: `${pct}%` }} /></div>
+        <span className={`badge ${j.status === 'done' ? 'green' : j.status === 'error' ? 'red' : 'blue'}`}>
+          <span className="dot" />{label}{j.status === 'running' ? ` ${pct}%` : ''}
+        </span>
+      </div>
+      {j.error && <div className="muted small job-error">{j.error}</div>}
+    </div>
   )
 }

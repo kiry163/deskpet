@@ -6,11 +6,13 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::assets::RoleAssets;
+use crate::behavior::{self, StateDef};
 use crate::clip::{ClipDecoder, H, W};
 use crate::config::PetConfig;
+use crate::db::ActionRow;
 use crate::menu::MenuEntry;
 use crate::platform::{cursor_pos, PetWindow};
-use crate::state::{self, Category};
+use crate::state;
 
 // 菜单 ID
 pub const MID_CORNER: usize = 190;
@@ -35,23 +37,9 @@ pub enum PetCommand {
     Say { text: String, duration_ms: Option<u64> },
 }
 
-/// 行为引擎参数（来自 PetConfig，阶段 3 配置化；见 docs/需求规格.md §5.2）。
+/// 行为引擎参数（来自 PetConfig；取决于最终设计：仅缩放档位；状态/间隔在状态集合里）。
 #[derive(Clone, Debug)]
 pub struct Behavior {
-    /// 待机分支概率（0..1，须 < turn_ratio）。
-    pub idle_ratio: f64,
-    /// 转向分支累积概率。
-    pub turn_ratio: f64,
-    /// 闲时动作分支累积概率（剩余为移动）。
-    pub act_ratio: f64,
-    /// 普通动画结束后停顿毫秒数（0 = 立即继续）。
-    pub act_interval_ms: u64,
-    /// 自主移动最小距离（像素）。
-    pub move_min_px: f64,
-    /// 自主移动最大距离（像素）。
-    pub move_max_px: f64,
-    /// 移动边界留白（像素）。
-    pub move_margin_px: f64,
     /// 缩放档位（大小菜单/设置页）。
     pub scale_steps: Vec<f64>,
 }
@@ -59,29 +47,108 @@ pub struct Behavior {
 impl From<&PetConfig> for Behavior {
     fn from(pc: &PetConfig) -> Behavior {
         Behavior {
-            idle_ratio: pc.idle_ratio,
-            turn_ratio: pc.turn_ratio,
-            act_ratio: pc.act_ratio,
-            act_interval_ms: pc.act_interval_ms,
-            move_min_px: pc.move_min_px,
-            move_max_px: pc.move_max_px,
-            move_margin_px: pc.move_margin_px,
             scale_steps: pc.scale_steps.clone(),
         }
     }
 }
 
+/// 宠物行为池：按状态划分的动作池（加权）+ 交互类动作 + 体型基准。
 #[derive(Clone)]
-struct MovePlan {
-    start_x: i32,
-    target_x: i32,
-    y: i32,
-    duration_ms: u64,
+pub struct StatePools {
+    /// state_id → [(动作名, 该状态下权重)]
+    pub pools: HashMap<String, Vec<(String, f64)>>,
+    /// 点击回应动作池
+    pub clicks: Vec<String>,
+    /// 拖拽反馈动作（取第一个）
+    pub drag: Option<String>,
+    /// 体型基准动作（待机）
+    pub idle: Option<String>,
+}
+
+impl StatePools {
+    /// 取某状态的动作池（缺省为空）。
+    pub fn pool(&self, state_id: &str) -> &[(String, f64)] {
+        self.pools.get(state_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// 确保存在 id 状态池（缺省归入空闲池并启用，保证桌宠会动）。
+    pub fn ensure_idle_pool(&mut self) {
+        if !self.pools.contains_key("idle") {
+            if let Some(idle) = self.idle.clone() {
+                self.pools.insert("idle".to_string(), vec![(idle, 1.0)]);
+            }
+        }
+    }
+}
+
+/// 由管理端动作配置构建行为池（最终模型）。
+/// - `actions`：pet_actions 行（交互 click/drag 或 state）。
+/// - `action_states`：(action, state_id, weight, enabled)，仅 state 类有效。
+/// - `names`：该宠物素材目录内全部 webm 名（未登记默认归入空闲池并启用）。
+pub fn build_pools(
+    names: &[String],
+    actions: &[ActionRow],
+    action_states: &[(String, String, f64, bool)],
+) -> StatePools {
+    let mut pools: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let mut clicks = Vec::new();
+    let mut drag = None;
+
+    // 动作 → 行 索引
+    let row_of: HashMap<&str, &ActionRow> =
+        actions.iter().map(|a| (a.action.as_str(), a)).collect();
+
+    // 动作 → 状态绑定（多选加权）
+    let mut bindings: HashMap<&str, Vec<(String, f64, bool)>> = HashMap::new();
+    for (action, state_id, weight, enabled) in action_states {
+        bindings.entry(action.as_str()).or_default().push((state_id.clone(), *weight, *enabled));
+    }
+
+    for name in names {
+        let row = row_of.get(name.as_str()).copied();
+        let owner_kind = row.map(|r| r.owner_kind.as_str()).unwrap_or("state");
+        let enabled = row.map(|r| r.enabled).unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        match owner_kind {
+            "interactive" => {
+                let kind = row.and_then(|r| r.kind.as_deref()).unwrap_or("");
+                if kind == "drag" && drag.is_none() {
+                    drag = Some(name.clone());
+                } else if kind == "click" {
+                    clicks.push(name.clone());
+                } else {
+                    // 未知交互类型 → 当作点击
+                    clicks.push(name.clone());
+                }
+            }
+            _ => {
+                // state 类：按 action_states 归属；无绑定默认归空闲池
+                let binds = bindings.get(name.as_str()).cloned().unwrap_or_else(|| vec![("idle".to_string(), 1.0, true)]);
+                for (state_id, weight, st_enabled) in binds {
+                    if st_enabled {
+                        pools.entry(state_id.clone()).or_default().push((name.clone(), weight));
+                    }
+                }
+            }
+        }
+    }
+
+    let idle = pools.get("idle").and_then(|v| v.first().map(|(n, _)| n.clone()));
+    let mut sp = StatePools { pools, clicks, drag, idle };
+    sp.ensure_idle_pool();
+    sp.idle = sp.pools.get("idle").and_then(|v| v.first().map(|(n, _)| n.clone()));
+    sp
 }
 
 pub struct Pet {
     pub win: PetWindow,
-    pub cats: Category,
+    pub pools: StatePools,
+    /// 程序级状态集合（状态机配置）。
+    pub states: Vec<StateDef>,
+    /// 当前状态 id（由状态机引擎维护）。
+    pub current_state: String,
     pub clips: HashMap<String, ClipDecoder>,
     pub cur_anim: String,
     pub facing_right: bool,
@@ -108,39 +175,35 @@ pub struct Pet {
     dragging: bool,
     just_dragged: bool,
 
-    move_plan: Option<MovePlan>,
-    move_accum_ms: u64,
-
-    /// 行为引擎参数（程序级，可热更新）。
+    /// 行为引擎参数（程序级，可热更新；移动/缩放）。
     pub behavior: Behavior,
-    /// 动作间隔冷却（普通动画结束后等待，None = 无需等待）。
+    /// 动作间隔冷却（状态动作结束后等待；None = 无需等待）。
     cooldown_until: Option<Instant>,
 
     last_tick: Instant,
 }
 
-/// 从素材集构建解码器 + 动态分类（分类来自管理端动作配置）。
+/// 从素材集 + 管理端动作配置构建解码器 + 行为池。
 fn build_from_role(
     role: &RoleAssets,
-    actions: &HashMap<String, (String, f64, bool)>,
-) -> (HashMap<String, ClipDecoder>, Category) {
+    pools: StatePools,
+    states: &[StateDef],
+) -> HashMap<String, ClipDecoder> {
     let mut clips: HashMap<String, ClipDecoder> = HashMap::new();
     for (name, wm) in &role.videos {
         if let Some(dec) = ClipDecoder::new(wm.clone()) {
             clips.insert(name.clone(), dec);
         }
     }
-    let cats = state::build_categories_from_actions(&role.names, actions);
     log_info!(
-        "动画分类: idle={:?} turn={:?} moves={} clicks={} drag={:?} acts={}",
-        cats.idle,
-        cats.turn,
-        cats.moves.len(),
-        cats.clicks.len(),
-        cats.drag,
-        cats.acts.len()
+        "行为池: idle={:?} clicks={} drag={:?} 状态池={:?} 状态数={}",
+        pools.idle,
+        pools.clicks.len(),
+        pools.drag,
+        pools.pools.len(),
+        states.len()
     );
-    (clips, cats)
+    clips
 }
 
 impl Pet {
@@ -148,12 +211,15 @@ impl Pet {
         win: PetWindow,
         role: &RoleAssets,
         pc: &PetConfig,
-        actions: &HashMap<String, (String, f64, bool)>,
+        pools: StatePools,
+        states: &[StateDef],
     ) -> Pet {
-        let (clips, cats) = build_from_role(role, actions);
+        let clips = build_from_role(role, pools.clone(), states);
         let mut pet = Pet {
             win,
-            cats,
+            pools,
+            states: states.to_vec(),
+            current_state: "idle".to_string(),
             clips,
             cur_anim: String::new(),
             facing_right: pc.facing_right,
@@ -173,8 +239,6 @@ impl Pet {
             grab_offset: None,
             dragging: false,
             just_dragged: false,
-            move_plan: None,
-            move_accum_ms: 0,
             behavior: Behavior::from(pc),
             cooldown_until: None,
             last_tick: Instant::now(),
@@ -182,7 +246,7 @@ impl Pet {
         let (w, h) = pet.window_size();
         pet.win.resize(w, h);
         pet.win.set_topmost(pc.always_on_top);
-        let idle = pet.cats.idle.clone().unwrap_or_default();
+        let idle = pet.pools.idle.clone().unwrap_or_default();
         pet.switch_anim(&idle);
         pet.win.show();
         pet.win.start_frame_timer(10);
@@ -195,16 +259,17 @@ impl Pet {
         (w.max(1), h.max(1))
     }
 
-    /// 热替换素材集（导入后 / 角色切换）：重建 clips/cats，重播待机动画，保留窗口与位置。
-    pub fn swap_role(&mut self, role: &RoleAssets, actions: &HashMap<String, (String, f64, bool)>) {
-        let (clips, cats) = build_from_role(role, actions);
+    /// 热替换素材集（导入后 / 角色切换）：重建 clips/行为池，重播待机动画，保留窗口与位置。
+    pub fn swap_role(&mut self, role: &RoleAssets, pools: StatePools, states: &[StateDef]) {
+        let clips = build_from_role(role, pools.clone(), states);
         self.clips = clips;
-        self.cats = cats;
-        self.cancel_move();
-        self.move_plan = None;
+        self.pools = pools;
+        self.states = states.to_vec();
+        self.current_state = "idle".to_string();
         self.cur_anim = String::new();
         self.anim_ended_fired = false;
-        let idle = self.cats.idle.clone().unwrap_or_default();
+        self.cooldown_until = None;
+        let idle = self.pools.idle.clone().unwrap_or_default();
         self.switch_anim(&idle);
         log_info!("素材已热替换（{} 段动画）", self.clips.len());
     }
@@ -237,7 +302,7 @@ impl Pet {
         }
     }
 
-    /// 动作名解析：精确名 → 语义名（idle/turn/move/act/click/drag）→ 子串最近匹配。
+    /// 动作名解析：精确名 → 语义名（idle/click/drag）→ 子串最近匹配。
     pub fn resolve_action(&self, query: &str) -> Option<String> {
         let q = query.trim();
         if q.is_empty() {
@@ -247,12 +312,9 @@ impl Pet {
             return Some(q.to_string());
         }
         let sem = match q.to_ascii_lowercase().as_str() {
-            "idle" => self.cats.idle.clone(),
-            "turn" => self.cats.turns.first().cloned(),
-            "move" | "moves" => self.cats.moves.first().cloned(),
-            "act" | "acts" => self.cats.acts.first().cloned(),
-            "click" | "clicks" => self.cats.clicks.first().cloned(),
-            "drag" => self.cats.drag.clone(),
+            "idle" => self.pools.idle.clone(),
+            "click" | "clicks" => self.pools.clicks.first().cloned(),
+            "drag" => self.pools.drag.clone(),
             _ => None,
         };
         if let Some(n) = sem {
@@ -272,7 +334,6 @@ impl Pet {
         let ty = (ly as f64 + y.clamp(0.0, 1.0) * (ry - ly) as f64) as i32 - wh / 2;
         let tx = tx.clamp(lx, (rx - wx).max(lx));
         let ty = ty.clamp(ly, (ry - wh).max(ly));
-        self.cancel_move();
         self.win.move_to(tx, ty);
         log_info!("指令 move: ({:.2}, {:.2}) -> ({}, {})", x, y, tx, ty);
     }
@@ -282,7 +343,6 @@ impl Pet {
             return;
         }
         log_info!("动画: {} -> {}", self.cur_anim, name);
-        self.cancel_move();
         self.cur_anim = name.to_string();
         if let Some(clip) = self.clips.get_mut(&self.cur_anim) {
             clip.seek(0);
@@ -324,81 +384,76 @@ impl Pet {
 
     fn on_anim_ended(&mut self) {
         let name = self.cur_anim.clone();
-        let drag = self.cats.drag.clone().unwrap_or_default();
+        let drag = self.pools.drag.clone().unwrap_or_default();
         if name == drag && self.dragging {
+            // 拖拽中：循环播放拖拽动作
             if let Some(clip) = self.clips.get_mut(&self.cur_anim) {
                 clip.seek(0);
             }
             self.anim_ended_fired = false;
             return;
         }
-        if self.cats.turns.contains(&name) {
-            self.facing_right = !self.facing_right;
-        }
-        if name == drag || self.cats.clicks.contains(&name) {
-            // 交互动画 → 待机缓冲
-            self.switch_anim(&self.cats.idle.clone().unwrap_or_default());
+        if name == drag || self.pools.clicks.contains(&name) {
+            // 交互动画结束 → 回到当前状态的自主循环（不改变状态）
+            self.play_from_current_state();
             return;
         }
-        // 普通动画结束：若配置了动作间隔，先停顿再继续动画链
-        if self.behavior.act_interval_ms > 0 {
-            self.cooldown_until =
-                Some(Instant::now() + Duration::from_millis(self.behavior.act_interval_ms));
+        // 状态动作结束：按「当前状态的间隔」停顿后再继续
+        let interval = self.current_state_interval_ms();
+        if interval > 0 {
+            self.cooldown_until = Some(Instant::now() + Duration::from_millis(interval));
             return;
         }
         self.pick_next_anim();
     }
 
-    /// 动画链推进：先尝试规划移动，否则按配置占比选下一个动画。
+    /// 动画链推进：重算当前状态（支持时段切换）→ 从该状态动作池加权随机选下一个。
     fn pick_next_anim(&mut self) {
-        let can_move = self.try_plan_move();
-        let next = state::pick_next(
-            &self.cats,
-            &self.cur_anim,
-            self.no_move,
-            can_move,
-            self.behavior.idle_ratio,
-            self.behavior.turn_ratio,
-            self.behavior.act_ratio,
-        );
-        self.switch_anim(&next);
+        self.current_state = behavior::Engine::pick_state(
+            &self.states,
+            state::now_minutes(),
+            &mut || behavior::rand_f64(),
+        )
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| "idle".to_string());
+        self.play_from_current_state();
     }
 
-    fn try_plan_move(&mut self) -> bool {
-        if self.no_move || self.move_plan.is_some() {
+    /// 从当前状态动作池选一个动作播放（空则回退空闲池）。
+    fn play_from_current_state(&mut self) {
+        let pool = self.pools.pool(&self.current_state).to_vec();
+        if pool.is_empty() {
+            let _ = self.play_from_pool(&self.pools.pool("idle").to_vec());
+            return;
+        }
+        let _ = self.play_from_pool(&pool);
+    }
+
+    fn play_from_pool(&mut self, pool: &[(String, f64)]) -> bool {
+        if pool.is_empty() {
             return false;
         }
-        let (lx, _ly, rx, _ry) = self.avail_rect();
-        let (wx, _) = self.window_size();
-        let (x, _, x2, _) = self.win.get_rect();
-        let cx = (x + x2) as f64 / 2.0;
-        let dir_sign = if self.facing_right { 1.0 } else { -1.0 };
-        let distance = self.behavior.move_min_px
-            + (self.behavior.move_max_px - self.behavior.move_min_px) * state::rand_f64();
-        let target_cx = cx + dir_sign * distance;
-        let half_w = wx as f64 / 2.0;
-        if target_cx < lx as f64 + self.behavior.move_margin_px + half_w
-            || target_cx > rx as f64 - self.behavior.move_margin_px - half_w
-        {
-            return false;
-        }
-        let move_name = state::pick(&self.cats.moves, &self.cats.weights, None);
-        let duration_ms = self.clips.get(&move_name).map(|c| c.duration_ms()).unwrap_or(2400);
-        self.switch_anim(&move_name);
-        self.move_plan = Some(MovePlan {
-            start_x: x,
-            target_x: (target_cx - half_w).round() as i32,
-            y: self.win.get_rect().1,
-            duration_ms,
-        });
-        self.move_accum_ms = 0;
-        log_info!("开始移动: {} -> x={}", move_name, (target_cx - half_w).round() as i32);
+        let names: Vec<String> = pool.iter().map(|(n, _)| n.clone()).collect();
+        let weights: HashMap<String, f64> = pool.iter().map(|(n, w)| (n.clone(), *w)).collect();
+        let next = behavior::pick_action(
+            &names,
+            &weights,
+            Some(&self.cur_anim),
+            &mut || behavior::rand_f64(),
+        )
+        .cloned()
+        .unwrap_or_else(|| names[0].clone());
+        self.switch_anim(&next);
         true
     }
 
-    fn cancel_move(&mut self) {
-        self.move_plan = None;
-        self.move_accum_ms = 0;
+    /// 当前状态的动作间隔（状态级，随机取范围内一值）。
+    fn current_state_interval_ms(&self) -> u64 {
+        self.states
+            .iter()
+            .find(|s| s.id == self.current_state)
+            .map(|s| s.interval.random_ms(&mut || behavior::rand_f64()))
+            .unwrap_or(0)
     }
 
     pub fn go_corner(&mut self) {
@@ -459,9 +514,6 @@ impl Pet {
 
     pub fn set_no_move(&mut self, on: bool) {
         self.no_move = on;
-        if on && self.move_plan.is_some() {
-            self.switch_anim(&self.cats.idle.clone().unwrap_or_default());
-        }
     }
 
     pub fn set_topmost(&mut self, on: bool) {
@@ -491,7 +543,6 @@ impl Pet {
         self.press_global = Some((sx, sy));
         self.grab_offset = Some((sx - wx, sy - wy));
         self.dragging = false;
-        self.cancel_move();
     }
 
     /// 鼠标移动（按下状态下）。用全局光标位置：鼠标可能已移出窗口边界。
@@ -513,7 +564,7 @@ impl Pet {
             }
             self.dragging = true;
             log_info!("开始拖拽");
-            self.switch_anim(&self.cats.drag.clone().unwrap_or_default());
+            self.switch_anim(&self.pools.drag.clone().unwrap_or_default());
         }
         if let Some(off) = self.grab_offset {
             self.win.move_to(sx - off.0, sy - off.1);
@@ -531,7 +582,7 @@ impl Pet {
                 self.win.move_to(sx - off.0, sy - off.1);
             }
             // 位置保存由 App 在拖拽结束后统一处理
-            self.switch_anim(&self.cats.idle.clone().unwrap_or_default());
+            self.play_from_current_state();
         } else {
             self.on_click();
         }
@@ -545,12 +596,12 @@ impl Pet {
             self.just_dragged = false;
             return;
         }
-        if self.cats.idle.as_deref() != Some(self.cur_anim.as_str()) {
+        // 仅在处于待机（体型基准）状态时响应点击
+        if self.pools.idle.as_deref() != Some(self.cur_anim.as_str()) {
             return;
         }
-        self.cancel_move();
-        let c = self.cats.clicks.clone();
-        let pick = state::pick(&c, &self.cats.weights, None);
+        let c = self.pools.clicks.clone();
+        let pick = state::pick(&c, &HashMap::new(), None);
         log_info!("点击回应: {}", pick);
         self.switch_anim(&pick);
     }
@@ -608,25 +659,6 @@ impl Pet {
                     self.cooldown_until = None;
                     self.pick_next_anim();
                 }
-            }
-        }
-
-        if let Some(plan) = self.move_plan.clone() {
-            self.move_accum_ms += dt_ms;
-            let t = self.move_accum_ms as f64 / 1000.0;
-            let dur = plan.duration_ms as f64 / 1000.0;
-            let (lead, tail) = (state::MOVE_LEAD_SEC, state::MOVE_TAIL_SEC);
-            let x = if t <= lead {
-                plan.start_x as f64
-            } else if t >= dur - tail {
-                plan.target_x as f64
-            } else {
-                let progress = (t - lead) / (dur - lead - tail).max(0.1);
-                plan.start_x as f64 + (plan.target_x - plan.start_x) as f64 * progress
-            };
-            self.win.move_to(x.round() as i32, plan.y);
-            if t >= dur - tail {
-                self.cancel_move();
             }
         }
     }

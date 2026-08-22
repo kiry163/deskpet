@@ -1,117 +1,149 @@
 import { useEffect, useState } from 'react'
-import { api, type ActionRow, type PetInfo } from '../api'
+import { api, PetInfo, PetState, ActionItem, SystemInfo } from '../api'
 
 export default function DashboardPage() {
-  const [pet, setPet] = useState<PetInfo | null>(null)
-  const [actions, setActions] = useState<ActionRow[]>([])
-  const [showUrl, setShowUrl] = useState<string | null>(null)
-  const [sayText, setSayText] = useState('')
-  const [playAction, setPlayAction] = useState('')
+  const [pets, setPets] = useState<PetInfo[]>([])
+  const [state, setState] = useState<PetState | null>(null)
+  const [actions, setActions] = useState<ActionItem[]>([])
+  const [sys, setSys] = useState<SystemInfo | null>(null)
+  const [selAction, setSelAction] = useState('')
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
-  // 加载当前桌宠：轮询保持状态同步
+  const current = pets.find((p) => p.is_current) ?? pets[0]
+
+  async function load() {
+    const [p, s, sy] = await Promise.all([api.pets(), api.state(), api.system()])
+    if (p.ok && p.data) setPets(p.data)
+    if (s.ok && s.data) setState(s.data.pet ?? null)
+    if (sy.ok && sy.data) setSys(sy.data)
+  }
+
   useEffect(() => {
-    let alive = true
-    async function load() {
-      const pets = await api.pets()
-      if (!alive) return
-      if (!pets.ok || !pets.data) return
-      const cur = pets.data.find((p) => p.is_current) ?? null
-      setPet(cur)
-      if (cur) {
-        const acts = await api.petActions(cur.id)
-        if (!alive) return
-        if (acts.ok && acts.data) {
-          setActions(acts.data)
-          // 展示形象：优先待机动画，否则第一个启用的动画
-          const idle =
-            acts.data.find((a) => a.trigger === 'idle' && a.enabled) ??
-            acts.data.find((a) => a.enabled) ??
-            acts.data[0]
-          if (idle) setShowUrl(api.webmUrl(cur.id, idle.action))
-        }
-      } else {
-        setShowUrl(null)
-        setActions([])
-      }
-    }
     load()
-    const t = setInterval(load, 3000)
-    return () => {
-      alive = false
-      clearInterval(t)
-    }
   }, [])
 
-  async function say() {
-    const text = sayText.trim()
-    if (!text) return
-    const r = await api.say(text)
-    setMsg(r.ok ? { ok: true, text: '它听到了～' } : { ok: false, text: r.error ?? '失败了' })
-    if (r.ok) setSayText('')
-  }
+  useEffect(() => {
+    if (current) {
+      api.petActions(current.id).then((r) => {
+        if (r.ok && r.data) setActions(r.data)
+      })
+    }
+  }, [current?.id])
 
-  async function play() {
-    if (!playAction) return
-    const r = await api.play(playAction)
-    setMsg(r.ok ? { ok: true, text: `正在播放「${r.data?.played ?? playAction}」` } : { ok: false, text: r.error ?? '失败了' })
-  }
+  const activeActions = actions.filter((a) => a.enabled).map((a) => ({
+    label: a.display_name,
+    value: a.action,
+  }))
 
-  if (!pet) {
-    return (
-      <>
-        <div className="card">
-          <h1 className="page-title">还没有桌宠</h1>
-          <p className="muted">先去「我的桌宠」页添加一个素材包吧～</p>
-        </div>
-      </>
-    )
+  async function act(fn: () => Promise<unknown>, okText: string) {
+    const r = (await fn()) as { ok: boolean; error?: string }
+    setMsg({ ok: r.ok, text: r.ok ? okText : r.error ?? '操作失败' })
+    setTimeout(() => setMsg(null), 3000)
   }
 
   return (
-    <>
+    <div>
       <div className="card">
-        <div className="pet-stage">
-          {showUrl && <video src={showUrl} autoPlay loop muted playsInline />}
-          <div className="name">{pet.display_name}</div>
-          <div className="sub">{pet.video_count} 个动画</div>
+        <div className="current-pet">
+          <PetImage pet={current} />
+          <div className="cp-info">
+            <div className="cp-name">
+              {current ? current.display_name : '未导入桌宠'}
+              {current?.is_current && <span className="badge green"><span className="dot" />当前</span>}
+            </div>
+            <div className="muted small">
+              {current
+                ? `全身照（来自待机动画）· ${current.video_count} 个动作`
+                : '通过「宠物管理」导入素材包后即可运行'}
+            </div>
+            {current && (
+              <div className="cp-badges">
+                <span className="badge blue"><span className="dot" />状态:{stateLabel(state?.state_id)}</span>
+                <span className="badge orange"><span className="dot" />当前动作:{state?.anim ?? '—'}</span>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {msg && <div className={'msg ' + (msg.ok ? 'ok' : 'err')}>{msg.text}</div>}
+      {msg && <div className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
 
-      <div className="card">
-        <h2 className="card-title">对它说点什么</h2>
-        <div className="row">
-          <input
-            type="text"
-            placeholder="输入想让它说的话…"
-            value={sayText}
-            onChange={(e) => setSayText(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && say()}
-          />
-          <button className="btn primary" disabled={!sayText.trim()} onClick={say}>
-            说
-          </button>
+      <div className="grid g3">
+        <div className="card">
+          <div className="label">位置</div>
+          <div className="value">{state ? `(x:${state.x.toFixed(0)}, y:${state.y.toFixed(0)})` : '—'}</div>
+        </div>
+        <div className="card">
+          <div className="label">大小 / 朝向</div>
+          <div className="value">{state ? `${Math.round(state.scale * 100)}% · ${state.facing_right ? '朝右' : '朝左'}` : '—'}</div>
+        </div>
+        <div className="card">
+          <div className="label">可见性</div>
+          <div className="value">
+            {state ? (
+              <span className={`badge ${state.visible ? 'green' : ''}`}>
+                <span className="dot" />{state.visible ? '显示中' : '已隐藏'}
+              </span>
+            ) : '—'}
+          </div>
         </div>
       </div>
 
       <div className="card">
-        <h2 className="card-title">播放动画</h2>
-        <div className="row">
-          <select value={playAction} onChange={(e) => setPlayAction(e.target.value)} style={{ flex: 1 }}>
-            <option value="">选择一个动画…</option>
-            {actions.map((a) => (
-              <option key={a.action} value={a.action}>
-                {a.action}
-              </option>
-            ))}
-          </select>
-          <button className="btn primary" disabled={!playAction} onClick={play}>
-            播放
-          </button>
+        <div className="section-h">快捷操作</div>
+        <div className="quick">
+          {current && (
+            <>
+              <select value={selAction} onChange={(e) => setSelAction(e.target.value)}>
+                <option value="">选择要试播的动作…</option>
+                {activeActions.map((a) => (
+                  <option key={a.value} value={a.value}>{a.label}</option>
+                ))}
+              </select>
+              <button className="btn primary" disabled={!selAction} onClick={() => act(() => api.play(selAction), '已播放')}>▶ 试播动作</button>
+              <button className="btn" onClick={() => act(() => api.move(0.5, 0.62), '已移动')}>⇄ 移到屏幕下部</button>
+              <button className="btn" onClick={() => act(() => api.patchConfig({ visible: !(state?.visible ?? true) }), state?.visible ? '已隐藏' : '已显示')}>
+                {state?.visible ? '隐藏' : '显示'}
+              </button>
+            </>
+          )}
+          <button className="btn danger" onClick={() => act(() => api.quit(), '已关闭桌宠')}>关闭桌宠</button>
         </div>
       </div>
-    </>
+
+      <div className="card">
+        <div className="section-h">系统信息</div>
+        <div className="grid g3">
+          <div><div className="label">版本</div><div className="value">{sys?.version ?? '—'}</div></div>
+          <div><div className="label">端口</div><div className="value">{sys?.port ?? '—'}</div></div>
+          <div><div className="label">日志级别</div><div className="value">{sys?.log_level ?? '—'}</div></div>
+          <div><div className="label">数据库</div><div className="value small">{sys?.db_path ?? '—'}</div></div>
+          <div><div className="label">素材目录</div><div className="value small">{sys?.assets_dir ?? '—'}</div></div>
+          <div><div className="label">系统</div><div className="value">{sys?.os ?? '—'}</div></div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function stateLabel(id: string | null | undefined): string {
+  const map: Record<string, string> = { idle: '空闲', active: '活跃', lunch: '午休' }
+  return (id && map[id]) || id || '—'
+}
+
+export function PetImage({ pet, className = '' }: { pet?: PetInfo; className?: string }) {
+  const [err, setErr] = useState(false)
+  useEffect(() => setErr(false), [pet?.id])
+  // 始终尝试加载全身照；图片缺失/加载失败时才回退到首字占位
+  if (!pet || err) {
+    return <div className={`pet-ph ${className}`}>{pet?.display_name?.slice(0, 2) ?? '?'}</div>
+  }
+  return (
+    <img
+      className={`pet-ph img ${className}`}
+      src={pet.fullbody_url}
+      alt={pet.display_name}
+      onError={() => setErr(true)}
+    />
   )
 }

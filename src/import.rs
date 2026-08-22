@@ -1,9 +1,12 @@
-//! 素材 zip 导入（见 docs/需求规格.md §4）：**仅扫描 webm**，无 manifest / videos 结构要求。
+//! 素材 zip 导入（见 docs/需求规格.md §4）：**递归扫描 webm**（无 manifest 也能导入），
+//! 若含 `manifest.yaml` 则解析出**宠物名 / 待机基准 / 动作→状态归属**（见 docs/行为状态机设计.md §11）。
 //! 流程：校验（zip 可读、每个 webm 可解析）→ 平铺解压全部 webm 到 `<素材根>/<id>/`
-//! （动画名 = 文件名 stem）→ 返回报告（动画清单供注册默认动作配置）。
+//! （动画名 = 文件名 stem）→ 返回报告（含可选 manifest 数据供注册）。
 //! 校验失败不落盘任何内容，解压走临时目录 + 原子替换，避免污染素材根。
 
+use serde::Deserialize;
 use std::io::{Cursor, Read, Seek};
+use std::path::Path;
 
 use crate::webm::WebM;
 use zip::ZipArchive;
@@ -17,6 +20,135 @@ pub struct ImportReport {
     /// 成功校验的动画名（webm 文件名 stem，唯一）。
     pub videos: Vec<String>,
     pub warnings: Vec<String>,
+    /// manifest 给出的宠物名（可选；缺省用 id）。
+    pub pet_name: Option<String>,
+    /// 体型基准（待机）动作名（manifest.idle，可选）。
+    pub idle: Option<String>,
+    /// manifest 解析出的动作归属（空 = 由调用方用默认值）。
+    pub actions: Vec<crate::db::ActionRow>,
+    /// 动作 → 状态绑定（空 = 默认归空闲池）。
+    pub action_states: Vec<(String, String, f64, bool)>,
+}
+
+// ---------------- manifest（可选） ----------------
+
+#[derive(Deserialize, Default)]
+struct PetManifest {
+    #[serde(default)] pet: Option<PetMeta>,
+    #[serde(default)] idle: Option<String>,
+    #[serde(default)] actions: Vec<RawAction>,
+}
+
+#[derive(Deserialize, Default)]
+struct PetMeta {
+    #[serde(default)] name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawAction {
+    file: String,
+    #[serde(default)] display_name: Option<String>,
+    /// state | click | drag
+    #[serde(default)] owner: Option<String>,
+    #[serde(default)] states: Vec<RawState>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawState {
+    state: String,
+    #[serde(default)] weight: Option<f64>,
+    #[serde(default)] enabled: Option<bool>,
+}
+
+/// 从 manifest 构建动作归属 + 状态绑定 + 待机基准。
+fn build_from_manifest(
+    m: &PetManifest,
+    valid: &[String],
+) -> (Vec<crate::db::ActionRow>, Vec<(String, String, f64, bool)>, Option<String>) {
+    let mut actions = Vec::new();
+    let mut action_states = Vec::new();
+    let row_of: std::collections::HashMap<&str, &RawAction> =
+        m.actions.iter().map(|a| (a.file.as_str(), a)).collect();
+
+    for name in valid {
+        let raw = row_of.get(name.as_str()).copied();
+        let owner = raw.and_then(|r| r.owner.clone()).unwrap_or_else(|| "state".to_string());
+        let display_name = raw.and_then(|r| r.display_name.clone()).unwrap_or_else(|| name.clone());
+        if owner == "click" || owner == "drag" {
+            actions.push(crate::db::ActionRow {
+                action: name.clone(),
+                display_name,
+                owner_kind: "interactive".to_string(),
+                kind: Some(owner.clone()),
+                enabled: true,
+            });
+            continue;
+        }
+        actions.push(crate::db::ActionRow {
+            action: name.clone(),
+            display_name,
+            owner_kind: "state".to_string(),
+            kind: None,
+            enabled: true,
+        });
+        if let Some(raw) = raw {
+            for st in &raw.states {
+                action_states.push((
+                    name.clone(),
+                    st.state.clone(),
+                    st.weight.unwrap_or(1.0),
+                    st.enabled.unwrap_or(true),
+                ));
+            }
+        }
+        if action_states_last_is_empty(&action_states, name) {
+            // 未声明归属 → 默认空闲池
+            action_states.push((name.clone(), "idle".to_string(), 1.0, true));
+        }
+    }
+    // 待机基准：manifest.idle 合法则用它，否则取第一个动作
+    let idle = match m.idle.as_deref() {
+        Some(idle) if valid.iter().any(|n| n == idle) => Some(idle.to_string()),
+        _ => valid.first().cloned(),
+    };
+    (actions, action_states, idle)
+}
+
+fn action_states_last_is_empty(list: &[(String, String, f64, bool)], name: &str) -> bool {
+    !list.iter().any(|(a, _, _, _)| a == name)
+}
+
+/// 解析待机基准（体型基准/全身照来源）：
+/// 优先「动作绑定到 idle 状态池」的返回顺序，其次第一个 state 类动作，最后第一个视频。
+/// 供 `apply_import` 无 manifest.idle 时兜底，与 `build_from_manifest` 的默认归属一致。
+pub fn resolve_idle_from(
+    actions: &[crate::db::ActionRow],
+    action_states: &[(String, String, f64, bool)],
+    videos: &[String],
+) -> Option<String> {
+    for (a, s, _, _) in action_states {
+        if s == "idle" {
+            return Some(a.clone());
+        }
+    }
+    for a in actions {
+        if a.owner_kind == "state" {
+            return Some(a.action.clone());
+        }
+    }
+    videos.first().cloned()
+}
+
+/// 从待机动画提取一帧并落盘为 `<素材根>/<pet_id>/fullbody.png`，返回相对文件名。
+/// 若该动作的 webm 缺失或取帧失败，返回 Err（调用方用 None 容忍，不阻断导入）。
+pub fn generate_full_body(assets_root: &Path, pet_id: &str, idle_action: &str) -> Result<String, String> {
+    let src = assets_root.join(pet_id).join(format!("{}.webm", idle_action));
+    let bytes = std::fs::read(&src).map_err(|e| format!("读取待机动画失败 {}: {}", src.display(), e))?;
+    let png = crate::thumb::extract_png(&bytes).ok_or_else(|| format!("待机动画取帧失败: {}", idle_action))?;
+    let dest = assets_root.join(pet_id).join("fullbody.png");
+    std::fs::write(&dest, png).map_err(|e| format!("写入全身照失败: {}", e))?;
+    log_info!("全身照已生成: {}", dest.display());
+    Ok("fullbody.png".to_string())
 }
 
 /// 校验 zip 并解压到素材根。`Err` 表示失败（未落盘任何内容）。
@@ -58,7 +190,18 @@ pub fn import_zip(zip_bytes: &[u8], assets_root: &std::path::Path) -> Result<Imp
     // 3. 生成素材集 id（时间戳，避免与旧素材冲突）
     let id = new_pet_id();
 
-    // 4. 平铺解压 webm → <素材根>/<id>/（临时目录 + 原子替换）
+    // 4. 可选 manifest：宠物名 / 待机基准 / 动作归属
+    let manifest = read_manifest(&mut archive);
+    let (manifest_actions, manifest_states, manifest_idle) = match &manifest {
+        Some(m) => build_from_manifest(m, &ok_names),
+        None => (Vec::new(), Vec::new(), None),
+    };
+    if manifest.is_some() {
+        warnings.push("读取到 manifest，按清单配置动作归属".to_string());
+    }
+    let pet_name = manifest.and_then(|m| m.pet.and_then(|p| p.name)).filter(|s| !s.is_empty());
+
+    // 5. 平铺解压 webm → <素材根>/<id>/（临时目录 + 原子替换）
     extract_webm_to(assets_root, &id, &mut archive, &ok_entries, &mut warnings)?;
 
     Ok(ImportReport {
@@ -67,7 +210,35 @@ pub fn import_zip(zip_bytes: &[u8], assets_root: &std::path::Path) -> Result<Imp
         video_count: ok_entries.len(),
         videos: ok_names,
         warnings,
+        pet_name,
+        idle: manifest_idle,
+        actions: manifest_actions,
+        action_states: manifest_states,
     })
+}
+
+/// 读取 zip 内的 manifest.yaml / manifest.yml（返回 None 表示无）。
+fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<PetManifest> {
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).ok()?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry_name(&entry);
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with("manifest.yaml") || lower.ends_with("manifest.yml") {
+            let mut buf = Vec::new();
+            // 重新拿可读 entry（by_index 已 move）
+            drop(entry);
+            if let Ok(mut e) = archive.by_index(i) {
+                if e.read_to_end(&mut buf).is_ok() {
+                    return serde_yaml::from_slice::<PetManifest>(&buf).ok();
+                }
+            }
+            return None;
+        }
+    }
+    None
 }
 
 // ---------------- 工具 ----------------
@@ -163,4 +334,50 @@ fn entry_name(entry: &zip::read::ZipFile) -> String {
     let raw = entry.name_raw();
     let s = std::str::from_utf8(raw).unwrap_or_else(|_| entry.name());
     s.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_parses_and_builds_actions() {
+        let yaml = r#"
+pet:
+  name: 蓝发女仆
+idle: 待机呼吸休闲
+actions:
+  - file: 待机呼吸休闲
+    display_name: 待机呼吸休闲
+    owner: state
+    states:
+      - { state: idle, weight: 0.6 }
+  - file: 开心蹦跳
+    owner: state
+    states:
+      - { state: active, weight: 0.8 }
+  - file: 挥手打招呼
+    owner: click
+"#;
+        let m: PetManifest = serde_yaml::from_str(yaml).expect("manifest 应可解析");
+        assert_eq!(m.pet.as_ref().and_then(|p| p.name.as_deref()), Some("蓝发女仆"));
+        assert_eq!(m.idle.as_deref(), Some("待机呼吸休闲"));
+
+        let valid = vec!["待机呼吸休闲".to_string(), "开心蹦跳".to_string(), "挥手打招呼".to_string(), "未声明".to_string()];
+        let (actions, states, idle) = build_from_manifest(&m, &valid);
+
+        assert_eq!(idle.as_deref(), Some("待机呼吸休闲"));
+        // 交互类
+        let click = actions.iter().find(|a| a.action == "挥手打招呼").unwrap();
+        assert_eq!(click.owner_kind, "interactive");
+        assert_eq!(click.kind.as_deref(), Some("click"));
+        // 状态类
+        let state_row = actions.iter().find(|a| a.action == "开心蹦跳").unwrap();
+        assert_eq!(state_row.owner_kind, "state");
+        assert!(states.iter().any(|(a, s, w, _)| a == "开心蹦跳" && s == "active" && *w == 0.8));
+        // 未声明 → 默认空闲池
+        assert!(states.iter().any(|(a, s, _, _)| a == "未声明" && s == "idle"));
+        // manifest 未覆盖的 待机呼吸休闲 也有 idle 绑定（build_from_manifest 给它补了）
+        assert!(states.iter().any(|(a, s, _, _)| a == "待机呼吸休闲" && s == "idle"));
+    }
 }

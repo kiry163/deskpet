@@ -10,12 +10,6 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
-/// 当前 schema 版本。
-pub const SCHEMA_VERSION: i32 = 1;
-
-/// 触发类型（与 state.rs 行为模型对齐；无 manifest 后全部由管理端配置）。
-pub const TRIGGERS: [&str; 6] = ["click", "drag", "idle", "turn", "move", "idle_act"];
-
 /// 桌宠（素材集）注册行。
 #[derive(Clone, Debug)]
 pub struct PetRow {
@@ -26,12 +20,13 @@ pub struct PetRow {
     pub builtin: bool,
 }
 
-/// 动作配置行。
+/// 动作配置行（最终模型：交互 or 状态池）。
 #[derive(Clone, Debug)]
 pub struct ActionRow {
-    pub action: String,
-    pub trigger: String,
-    pub weight: f64,
+    pub action: String,       // key = webm 文件名 stem
+    pub display_name: String, // 显示名（用户可编辑）
+    pub owner_kind: String,   // 'interactive' | 'state'
+    pub kind: Option<String>, // interactive → 'click'/'drag'；state → None
     pub enabled: bool,
 }
 
@@ -40,21 +35,43 @@ pub struct Db {
     pub path: PathBuf,
 }
 
-const SCHEMA_V1: &str = r#"
+/// 建表 schema（最终模型）。无历史用户/无数据迁移，直接一次性建表；下次启动幂等。
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pets (
-  id          TEXT PRIMARY KEY,
-  display_name TEXT NOT NULL,
-  source      TEXT NOT NULL,
-  imported_at INTEGER NOT NULL,
-  builtin     INTEGER NOT NULL DEFAULT 0
+  id               TEXT PRIMARY KEY,
+  display_name     TEXT NOT NULL,
+  idle_action      TEXT,
+  full_body_image  TEXT,
+  source           TEXT NOT NULL,
+  imported_at      INTEGER NOT NULL,
+  builtin          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pet_actions (
-  pet_id  TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
-  action  TEXT NOT NULL,
-  trigger TEXT NOT NULL,
-  weight  REAL NOT NULL DEFAULT 1.0,
-  enabled INTEGER NOT NULL DEFAULT 1,
+  pet_id       TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+  action       TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  owner_kind   TEXT NOT NULL,
+  kind         TEXT,
+  enabled      INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (pet_id, action)
+);
+CREATE TABLE IF NOT EXISTS action_states (
+  pet_id   TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+  action   TEXT NOT NULL,
+  state_id TEXT NOT NULL,
+  weight   REAL NOT NULL DEFAULT 1.0,
+  enabled  INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (pet_id, action, state_id)
+);
+CREATE TABLE IF NOT EXISTS convert_jobs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  pet_id      TEXT NOT NULL,
+  src_path    TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  progress    REAL NOT NULL DEFAULT 0,
+  error       TEXT,
+  created_at  INTEGER NOT NULL,
+  finished_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS app_settings (
   key   TEXT PRIMARY KEY,
@@ -75,7 +92,7 @@ fn db_err(e: rusqlite::Error) -> String {
 }
 
 impl Db {
-    /// 打开（不存在则创建）数据库并迁移到最新 schema。
+    /// 打开（不存在则创建）数据库并建表（幂等）。
     pub fn open(path: &Path) -> Result<Db, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -86,7 +103,7 @@ impl Db {
         let conn = Connection::open(path).map_err(|e| format!("打开数据库失败 {}: {}", path.display(), e))?;
         let db = Db { conn, path: path.to_path_buf() };
         db.migrate()?;
-        log_info!("数据库就绪: {} (schema v{})", path.display(), SCHEMA_VERSION);
+        log_info!("数据库就绪: {}", path.display());
         Ok(db)
     }
 
@@ -104,13 +121,18 @@ impl Db {
         self.conn
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(db_err)?;
-        let ver: i32 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(db_err)?;
-        if ver < 1 {
-            self.conn.execute_batch(SCHEMA_V1).map_err(db_err)?;
-            self.conn.pragma_update(None, "user_version", 1).map_err(db_err)?;
+        self.conn.execute_batch(SCHEMA).map_err(db_err)?;
+        // 播种默认状态集合（无则写；用户已有修改时不覆盖）。
+        let _ = self.seed_default_behavior();
+        Ok(())
+    }
+
+    /// 若 app_settings 无 `behavior`（状态集合）则写入默认值（behavior::default_states）。
+    fn seed_default_behavior(&self) -> Result<(), String> {
+        if self.get_setting("behavior")?.is_none() {
+            let v = serde_json::to_string(&crate::behavior::default_states()).unwrap_or_default();
+            self.set_setting("behavior", &v)?;
+            log_info!("已播种默认状态集合 (behavior)");
         }
         Ok(())
     }
@@ -186,15 +208,16 @@ impl Db {
     pub fn list_actions(&self, pet_id: &str) -> Result<Vec<ActionRow>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT action, trigger, weight, enabled FROM pet_actions WHERE pet_id = ?1")
+            .prepare("SELECT action, display_name, owner_kind, kind, enabled FROM pet_actions WHERE pet_id = ?1")
             .map_err(db_err)?;
         let rows = stmt
             .query_map(params![pet_id], |r| {
                 Ok(ActionRow {
                     action: r.get(0)?,
-                    trigger: r.get(1)?,
-                    weight: r.get(2)?,
-                    enabled: r.get::<_, i64>(3)? != 0,
+                    display_name: r.get(1)?,
+                    owner_kind: r.get(2)?,
+                    kind: r.get(3)?,
+                    enabled: r.get::<_, i64>(4)? != 0,
                 })
             })
             .map_err(db_err)?
@@ -203,28 +226,29 @@ impl Db {
         Ok(rows)
     }
 
-    /// action → (trigger, weight, enabled) 映射（分类构建用）。
-    pub fn actions_map(&self, pet_id: &str) -> Result<HashMap<String, (String, f64, bool)>, String> {
-        let mut map = HashMap::new();
-        for a in self.list_actions(pet_id)? {
-            map.insert(a.action, (a.trigger, a.weight, a.enabled));
-        }
-        Ok(map)
-    }
-
-    /// 批量替换动作配置（导入/整表重置用）：事务内先删后插。
+    /// 批量替换动作配置（导入/整表重置用）：事务内先删后插 pet_actions 与 action_states。
     pub fn replace_actions(
         &mut self,
         pet_id: &str,
-        actions: &[(String, String, f64, bool)],
+        actions: &[ActionRow],
+        action_states: &[(String, String, f64, bool)],
     ) -> Result<(), String> {
         let tx = self.conn.transaction().map_err(db_err)?;
         tx.execute("DELETE FROM pet_actions WHERE pet_id = ?1", params![pet_id]).map_err(db_err)?;
-        for (action, trigger, weight, enabled) in actions {
+        tx.execute("DELETE FROM action_states WHERE pet_id = ?1", params![pet_id]).map_err(db_err)?;
+        for a in actions {
             tx.execute(
-                "INSERT OR REPLACE INTO pet_actions (pet_id, action, trigger, weight, enabled)
+                "INSERT OR REPLACE INTO pet_actions (pet_id, action, display_name, owner_kind, kind, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![pet_id, a.action, a.display_name, a.owner_kind, a.kind, a.enabled as i64],
+            )
+            .map_err(db_err)?;
+        }
+        for (action, state_id, weight, enabled) in action_states {
+            tx.execute(
+                "INSERT OR REPLACE INTO action_states (pet_id, action, state_id, weight, enabled)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![pet_id, action, trigger, weight, *enabled as i64],
+                params![pet_id, action, state_id, weight, *enabled as i64],
             )
             .map_err(db_err)?;
         }
@@ -232,22 +256,32 @@ impl Db {
         Ok(())
     }
 
-    /// 单条更新（管理端逐条保存）。
+    /// 单条更新（管理端逐条保存，含归属与状态绑定）。
     pub fn upsert_action(
         &self,
         pet_id: &str,
-        action: &str,
-        trigger: &str,
-        weight: f64,
-        enabled: bool,
+        row: &ActionRow,
+        action_states: &[(String, f64, bool)],
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO pet_actions (pet_id, action, trigger, weight, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![pet_id, action, trigger, weight, enabled as i64],
+                "INSERT OR REPLACE INTO pet_actions (pet_id, action, display_name, owner_kind, kind, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![pet_id, row.action, row.display_name, row.owner_kind, row.kind, row.enabled as i64],
             )
             .map_err(db_err)?;
+        self.conn
+            .execute("DELETE FROM action_states WHERE pet_id = ?1 AND action = ?2", params![pet_id, row.action])
+            .map_err(db_err)?;
+        for (state_id, weight, enabled) in action_states {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO action_states (pet_id, action, state_id, weight, enabled)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![pet_id, row.action, state_id, weight, *enabled as i64],
+                )
+                .map_err(db_err)?;
+        }
         Ok(())
     }
 
@@ -293,6 +327,127 @@ impl Db {
             "INSERT INTO import_log (pet_id, file_name, result, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![pet_id, file_name, result, detail, now_secs()],
         );
+    }
+
+    // ---------------- behavior：状态集合（程序级，app_settings["behavior"]） ----------------
+
+    /// 读取状态集合（缺省用默认值）。用户编辑后以库中值为准。
+    pub fn get_behavior_states(&self) -> Result<Vec<crate::behavior::StateDef>, String> {
+        let raw = self.get_setting("behavior")?;
+        match raw {
+            Some(s) => serde_json::from_str::<Vec<crate::behavior::StateDef>>(&s)
+                .map_err(|e| format!("解析状态集合失败: {}", e)),
+            None => Ok(crate::behavior::default_states()),
+        }
+    }
+
+    pub fn set_behavior_states(&self, states: &[crate::behavior::StateDef]) -> Result<(), String> {
+        let v = serde_json::to_string(states).map_err(|e| format!("序列化状态集合失败: {}", e))?;
+        self.set_setting("behavior", &v)
+    }
+
+    // ---------------- pets 基线（体型基准 + 全身照） ----------------
+
+    /// 记录宠物体型基准（待机动作）与全身照（自动由待机取帧）。
+    pub fn set_pet_baseline(&self, id: &str, idle_action: &str, full_body_image: Option<&str>) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE pets SET idle_action = ?1, full_body_image = ?2 WHERE id = ?3",
+                params![idle_action, full_body_image, id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// 读取宠物基线记录。
+    pub fn pet_baseline(&self, id: &str) -> Result<(Option<String>, Option<String>), String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idle_action, full_body_image FROM pets WHERE id = ?1")
+            .map_err(db_err)?;
+        let mut rows = stmt.query_map(params![id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))).map_err(db_err)?;
+        match rows.next().transpose().map_err(db_err)? {
+            Some(v) => Ok(v),
+            None => Ok((None, None)),
+        }
+    }
+
+    // ---------------- action_states（动作 → 状态多选，按状态各自权重） ----------------
+
+    /// 列出该宠物全部「动作→状态」绑定。
+    pub fn list_action_states(&self, pet_id: &str) -> Result<Vec<(String, String, f64, bool)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT action, state_id, weight, enabled FROM action_states WHERE pet_id = ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![pet_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, bool>(3)?))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// 替换某宠物的「动作→状态」绑定（事务内先删后插）。
+    pub fn replace_action_states(&mut self, pet_id: &str, rows: &[(String, String, f64, bool)]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(db_err)?;
+        tx.execute("DELETE FROM action_states WHERE pet_id = ?1", params![pet_id]).map_err(db_err)?;
+        for (action, state_id, weight, enabled) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO action_states (pet_id, action, state_id, weight, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pet_id, action, state_id, weight, *enabled as i64],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    // ---------------- convert_jobs（异步转换作业） ----------------
+
+    pub fn insert_convert_job(&self, pet_id: &str, src_path: &str) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO convert_jobs (pet_id, src_path, status, progress, created_at) VALUES (?1, ?2, 'queued', 0, ?3)",
+                params![pet_id, src_path, now_secs()],
+            )
+            .map_err(db_err)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_convert_job(&self, id: i64, status: &str, progress: f64, error: Option<&str>) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE convert_jobs SET status=?1, progress=?2, error=?3, finished_at=?4 WHERE id=?5",
+                params![status, progress, error, if status == "done" || status == "error" { Some(now_secs()) } else { None }, id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn list_convert_jobs(&self, pet_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, src_path, status, progress, error, created_at FROM convert_jobs WHERE pet_id = ?1 ORDER BY id")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![pet_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "src": r.get::<_, String>(1)?,
+                    "status": r.get::<_, String>(2)?,
+                    "progress": r.get::<_, f64>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
+                    "created_at": r.get::<_, i64>(5)?,
+                }))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
     }
 }
 

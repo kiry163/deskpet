@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>桌宠控制台 · 预览 v2</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#fff; --line:#e6e9f0; --text:#1f2430; --muted:#7b8496;
+    --accent:#4a6cf7; --accent-soft:#eef1fe; --green:#1f9d63; --green-soft:#e7f6ee;
+    --orange:#e58a2b; --orange-soft:#fdf1e2; --red:#e5484d; --red-soft:#fdecec;
+    --radius:12px; --shadow:0 1px 3px rgba(20,30,60,.06),0 6px 20px rgba(20,30,60,.05);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:var(--bg)}
+  a{color:var(--accent);text-decoration:none}
+  .app{display:flex;min-height:100vh}
+  .sidebar{width:232px;background:var(--panel);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 18px}
+  .brand .logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#7b6cf7);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700}
+  .brand b{font-size:16px}
+  .nav{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+  .nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:9px;color:var(--muted);font-weight:500;cursor:pointer}
+  .nav a .ic{width:18px;text-align:center;font-size:15px}
+  .nav a:hover{background:#f2f4f9;color:var(--text)}
+  .nav a.active{background:var(--accent-soft);color:var(--accent)}
+  .side-foot{margin-top:auto;padding:10px;color:var(--muted);font-size:12px}
+
+  .main{flex:1;min-width:0;padding:22px 26px 60px}
+  .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap}
+  .topbar h1{font-size:20px;margin:0}
+  .topbar .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px;margin-bottom:16px}
+  .grid{display:grid;gap:16px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:920px){.g3,.g2{grid-template-columns:1fr}}
+  .muted{color:var(--muted)}
+  .small{font-size:12px}
+  .section-h{font-size:14px;font-weight:600;margin:0 0 12px;display:flex;align-items:center;gap:8px}
+  .hint{color:var(--muted);font-size:12.5px;margin:-6px 0 14px}
+  .label{font-size:12.5px;color:var(--muted);margin-bottom:6px;display:block}
+  .value{font-weight:600}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600}
+  .badge.blue{background:var(--accent-soft);color:var(--accent)}
+  .badge.green{background:var(--green-soft);color:var(--green)}
+  .badge.orange{background:var(--orange-soft);color:var(--orange)}
+  .badge.red{background:var(--red-soft);color:var(--red)}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .btn{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:#fff;color:var(--text);padding:8px 14px;border-radius:9px;font-weight:500;cursor:pointer;font-size:13px}
+  .btn:hover{border-color:#d5dae6}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:#3d5ff0}
+  .btn.ghost{border-color:transparent;color:var(--accent);background:transparent}
+  .btn.danger{color:var(--red)}
+  .btn.sm{padding:5px 10px;font-size:12px}
+  .table{width:100%;border-collapse:collapse;font-size:13px}
+  .table th,.table td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+  .table th{color:var(--muted);font-weight:600;font-size:12px}
+  .table tr:last-child td{border-bottom:none}
+  .switch{position:relative;width:40px;height:22px;border-radius:999px;background:#dfe3ec;cursor:pointer;transition:.18s;display:inline-block;vertical-align:middle}
+  .switch.on{background:var(--accent)}
+  .switch::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.18s}
+  .switch.on::after{left:21px}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .seg button{border:none;background:#fff;padding:7px 14px;font-size:12.5px;cursor:pointer;color:var(--muted)}
+  .seg button.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+  .pet{padding:14px;cursor:pointer;transition:.15s}
+  .pet:hover{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+  .pet .pv{width:100%;height:96px;border-radius:10px;background:linear-gradient(135deg,#e6ebf6,#eef1f6);display:flex;align-items:center;justify-content:center;color:#aab3c3;font-size:12px;font-weight:600;margin-bottom:10px;overflow:hidden}
+  .pet .pv img{width:100%;height:100%;object-fit:cover;display:block}
+  .pet.active{border-color:var(--accent)}
+  .pet-grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+  .pet-list{display:flex;flex-direction:column}
+  .pet-list .row{display:flex;align-items:center;gap:14px;padding:12px;border:1px solid var(--line);border-radius:10px;margin-bottom:10px;cursor:pointer}
+  .pet-list .row:hover{border-color:var(--accent)}
+  .pet-list .row .pv{width:52px;height:52px;border-radius:10px;background:#eef1f6;overflow:hidden;flex:none}
+  .pet-list .row .pv img{width:100%;height:100%;object-fit:cover;display:block}
+  .act{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+  .act video{width:100%;display:block;background:#fff}
+  .act .body{padding:12px}
+  .act-grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+  .chk{display:inline-flex;align-items:center;gap:6px;margin-right:14px;cursor:pointer;font-size:13px}
+  .chk input{accent-color:var(--accent)}
+  .time{display:flex;gap:8px;align-items:center}
+  .time input{padding:7px 10px;border:1px solid var(--line);border-radius:9px}
+  .empty{border:2px dashed var(--line);border-radius:12px;padding:40px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">宠</div><b>桌宠控制台</b></div>
+    <nav class="nav">
+      <a data-nav="overview" class="active"><span class="ic">◉</span>总览</a>
+      <a data-nav="pets"><span class="ic">♞</span>宠物管理</a>
+      <a data-nav="states"><span class="ic">⏱</span>状态配置</a>
+      <a data-nav="settings"><span class="ic">⚙</span>设置</a>
+    </nav>
+    <div class="side-foot">客户端 v2.0 · 端口 18686<br/>本地运行 · 数据仅存本机</div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div><h1 id="title">总览</h1><div class="sub" id="subtitle">看一眼桌宠现在怎么样</div></div>
+      <div class="top-actions">
+        <span class="muted small">当前宠物</span>
+        <select style="padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:#fff">
+          <option>蓝发女仆 · 小蓝</option><option>收红包 · 小可</option>
+        </select>
+        <span class="badge green"><span class="dot"></span>正在运行</span>
+      </div>
+    </div>
+
+    <!-- ===== 总览 ===== -->
+    <section data-page="overview">
+      <div class="card">
+        <div class="pet" style="cursor:default;display:flex;gap:14px;border:none;box-shadow:none">
+          <div class="pv" style="width:64px;height:64px;flex:none">小蓝</div>
+          <div style="flex:1">
+            <div style="font-size:16px;font-weight:600">蓝发女仆 · 小蓝</div>
+            <div class="muted">全身照：<a>查看</a> · 已加 12 个动作</div>
+          </div>
+          <span class="badge blue"><span class="dot"></span>状态：活跃</span>
+          <span class="badge orange"><span class="dot"></span>当前动作：开心蹦跳</span>
+        </div>
+      </div>
+      <div class="grid g3">
+        <div class="card"><div class="label">位置</div><div class="value">屏幕中下部 (0.5, 0.62)</div><div class="small muted">点击可拖动</div></div>
+        <div class="card"><div class="label">大小 / 朝向</div><div class="value">85% · 朝右</div></div>
+        <div class="card"><div class="label">可见性</div><div class="value"><span class="badge green"><span class="dot"></span>显示中</span></div></div>
+      </div>
+      <div class="card">
+        <div class="section-h">快捷操作</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn primary">▶ 试播动作</button><button class="btn">移动位置</button><button class="btn">隐藏</button><button class="btn danger">关闭桌宠</button>
+        </div>
+        <p class="hint" style="margin:12px 0 0">控制台的快捷指令主要给你手动试看用。</p>
+      </div>
+      <div class="card">
+        <div class="section-h">系统信息</div>
+        <div class="grid g3">
+          <div><div class="label">版本</div><div class="value">2.0.0</div></div>
+          <div><div class="label">端口</div><div class="value">18686</div></div>
+          <div><div class="label">数据文件</div><div class="value">~/Library/…/deskpet.db</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== 宠物管理 ===== -->
+    <section data-page="pets" hidden>
+      <!-- 宠物列表主页 -->
+      <div id="petsHome" class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <div><div style="font-weight:600">我的宠物</div><div class="muted small">点击某只宠物进入它的动作管理</div></div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <div class="seg" id="petView"><button class="on" data-v="grid">▦ 网格</button><button data-v="list">☰ 列表</button></div>
+            <button class="btn primary">＋ 导入宠物</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="petsBody">
+        <div id="petGrid" class="pet-grid">
+          <div class="pet" data-pet="xiaolan">
+            <div class="pv">小蓝</div>
+            <div style="font-weight:600">蓝发女仆 · 小蓝</div><div class="small muted">12 个动作</div>
+          </div>
+          <div class="pet" data-pet="xiaoke">
+            <div class="pv">小可</div>
+            <div style="font-weight:600">收红包 · 小可</div><div class="small muted">7 个动作</div>
+          </div>
+        </div>
+        <div id="petList" class="pet-list" hidden>
+          <div class="row" data-pet="xiaolan"><div class="pv">小蓝</div><div style="flex:1;font-weight:600">蓝发女仆 · 小蓝</div><div class="small muted">12 个动作</div></div>
+          <div class="row" data-pet="xiaoke"><div class="pv">小可</div><div style="flex:1;font-weight:600">收红包 · 小可</div><div class="small muted">7 个动作</div></div>
+        </div>
+        <div class="empty" id="noPet" hidden>还没有宠物<br/><div style="margin-top:12px"><button class="btn primary">＋ 导入宠物</button></div></div>
+      </div>
+
+      <!-- 宠物详情（动作管理） -->
+      <div id="petDetail" class="card" hidden>
+        <button class="btn ghost" id="backBtn">← 返回宠物列表</button>
+        <div style="display:flex;gap:14px;align-items:center;margin-top:10px">
+          <div class="pv" style="width:64px;height:64px;border-radius:12px;background:#eef1f6;display:flex;align-items:center;justify-content:center;color:#aab3c3">小蓝</div>
+          <div style="flex:1"><div style="font-size:16px;font-weight:600">蓝发女仆 · 小蓝</div><div class="muted small">12 个动作</div></div>
+          <button class="btn" id="editBtn">✎ 编辑</button>
+          <button class="btn primary">＋ 导入动作</button>
+        </div>
+        <div id="editPanel" style="display:none;margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:14px">
+          <div class="grid g2">
+            <div><div class="label">名称</div><input value="小蓝" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:9px"/></div>
+            <div><div class="label">全身照</div><div style="display:flex;gap:10px;align-items:center"><div style="width:44px;height:44px;border-radius:8px;background:#eef1f6">图</div><button class="btn sm">上传 / 更换</button></div></div>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px"><button class="btn primary sm">保存</button><button class="btn sm" id="editCancel">取消</button></div>
+        </div>
+      </div>
+
+      <!-- 动作管理 -->
+      <div id="actBlock" class="card" hidden>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <div><div class="section-h" style="margin:0">动作管理</div><div class="muted small">点开即播放预览；可调整每个动作的触发方式、所属状态与出现概率</div></div>
+          <div class="seg" id="actView"><button class="on" data-v="grid">▦ 网格</button><button data-v="list">☰ 列表</button></div>
+        </div>
+
+        <div id="actGrid" class="act-grid">
+          <div class="act">
+            <video src="../../蓝发女仆犯困-hsv.webm" loop muted autoplay playsinline></video>
+            <div class="body">
+              <div style="font-weight:600">开心蹦跳</div>
+              <div style="margin-top:10px"><div class="label">触发方式</div><div class="seg"><button data-t="click">点击</button><button data-t="drag">拖拽</button><button class="on" data-t="state">按时段</button></div></div>
+              <div id="statePick" style="margin-top:10px"><div class="label">所属状态（程序级定义）</div>
+                <label class="chk"><input type="checkbox" checked/>空闲</label><label class="chk"><input type="checkbox"/>活跃</label><label class="chk"><input type="checkbox"/>午休</label>
+              </div>
+              <div style="margin-top:10px"><div class="label">出现概率（在该状态下出现的频率）</div><input type="range" min="0" max="100" value="70"/><div class="small muted">70%</div></div>
+              <div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between"><span class="muted">启用</span><span class="switch on"></span></div>
+            </div>
+          </div>
+          <div class="act">
+            <video src="../../收红包-hsv.webm" loop muted playsinline></video>
+            <div class="body">
+              <div style="font-weight:600">打哈欠</div>
+              <div style="margin-top:10px"><div class="label">触发方式</div><div class="seg"><button data-t="click">点击</button><button data-t="drag">拖拽</button><button class="on" data-t="state">按时段</button></div></div>
+              <div style="margin-top:10px"><div class="label">所属状态（程序级定义）</div><label class="chk"><input type="checkbox" checked/>空闲</label><label class="chk"><input type="checkbox"/>活跃</label></div>
+              <div style="margin-top:10px"><div class="label">出现概率（在该状态下出现的频率）</div><input type="range" min="0" max="100" value="30"/><div class="small muted">30%</div></div>
+              <div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between"><span class="muted">启用</span><span class="switch on"></span></div>
+            </div>
+          </div>
+          <div class="act">
+            <div class="body" style="padding:20px">
+              <div style="font-weight:600">挥手打招呼</div><div class="muted small">交互类 · 不绑定状态</div>
+              <div style="margin-top:12px"><div class="label">触发方式</div><div class="seg"><button class="on" data-t="click">点击</button><button data-t="drag">拖拽</button><button data-t="state">按时段</button></div></div>
+              <div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between"><span class="muted">启用</span><span class="switch on"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="actList" class="card" hidden style="margin:0;padding:0">
+          <table class="table"><thead><tr><th style="width:52px"></th><th>动作</th><th>触发方式</th><th>所属状态</th><th>概率</th><th>启用</th></tr></thead><tbody>
+            <tr><td><video src="../../蓝发女仆犯困-hsv.webm" loop muted playsinline style="width:52px;height:34px;object-fit:cover;border-radius:8px"></video></td><td>开心蹦跳</td><td>按时段</td><td>空闲</td><td>70%</td><td><span class="switch on"></span></td></tr>
+            <tr><td><video src="../../收红包-hsv.webm" loop muted playsinline style="width:52px;height:34px;object-fit:cover;border-radius:8px"></video></td><td>打哈欠</td><td>按时段</td><td>空闲</td><td>30%</td><td><span class="switch on"></span></td></tr>
+          </tbody></table>
+        </div>
+
+        <div class="empty" id="noAct" hidden>这只宠物还没有动作<br/><div style="margin-top:12px"><button class="btn primary">＋ 导入动作</button></div></div>
+      </div>
+    </section>
+
+    <!-- ===== 状态配置（程序级） ===== -->
+    <section data-page="states" hidden>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <div><div style="font-weight:600">状态配置（程序级）</div><div class="muted small">这些状态是全局的，宠物管理的「动作」会绑定到这里的某个状态上</div></div>
+          <button class="btn primary">＋ 新增状态</button>
+        </div>
+      </div>
+      <div class="grid g2">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center"><div class="value">空闲 <span class="badge blue" style="margin-left:8px">内置</span></div><span class="switch on"></span></div>
+          <div style="margin-top:14px"><div class="label">出现频率（一天里大概多久处于此状态）</div><input type="range" min="0" max="100" value="70"/><div class="small muted">70%</div></div>
+          <div style="margin-top:12px"><div class="label">动作间隔（播完一个动作后等多久再播下一个）</div><div class="time"><input type="number" value="5" style="width:70px"/><span class="muted">~</span><input type="number" value="10" style="width:70px"/><span class="muted">秒</span></div></div>
+          <div style="margin-top:12px"><div class="label">指定时间段（可选）</div><div class="small muted">未设置 → 按上面的频率出现</div></div>
+        </div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center"><div class="value">活跃 <span class="badge blue" style="margin-left:8px">内置</span></div><span class="switch on"></span></div>
+          <div style="margin-top:14px"><div class="label">出现频率</div><input type="range" min="0" max="100" value="30"/><div class="small muted">30%</div></div>
+          <div style="margin-top:12px"><div class="label">动作间隔（播完一个动作后等多久再播下一个）</div><div class="time"><input type="number" value="2" style="width:70px"/><span class="muted">~</span><input type="number" value="3" style="width:70px"/><span class="muted">秒</span></div></div>
+          <div style="margin-top:12px"><div class="label">指定时间段（可选）</div><div class="small muted">未设置 → 按上面的频率出现</div></div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><div class="value">午休 <span class="badge blue" style="margin-left:8px">自定义</span></div><div style="display:flex;gap:8px"><button class="btn sm">编辑</button><button class="btn sm danger">删除</button></div></div>
+          <div class="grid g2" style="margin-top:14px">
+            <div><div class="label">指定时间段</div><div class="time"><input type="time" value="12:30"/><span class="muted">到</span><input type="time" value="14:00"/></div></div>
+            <div><div class="label">会出现吗（频率）</div><input type="range" min="0" max="100" value="0"/><div class="small muted">0% → 只在上面时段出现</div></div>
+            <div><div class="label">动作间隔（播完一个动作后等多久再播下一个）</div><div class="time"><input type="number" value="5" style="width:70px"/><span class="muted">~</span><input type="number" value="8" style="width:70px"/><span class="muted">秒</span></div></div>
+            <div><div class="label">进入方式</div><div class="seg"><button class="on">准点进入</button><button>顺延到下个状态</button></div></div>
+            <div><div class="label">结束方式</div><div class="seg"><button class="on">到点结束</button><button>顺延到下个状态</button></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card"><div class="section-h">说明</div><div class="muted">这些是全局状态。宠物动作里的「所属状态」会引用这里的空闲 / 活跃 / 午休；「动作间隔」按状态设置，决定在该状态下播完一个动作后等多久再播下一个。</div></div>
+    </section>
+
+    <!-- ===== 设置 ===== -->
+    <section data-page="settings" hidden>
+      <div class="card"><div class="section-h">行为</div><div class="grid g2"><div><div class="label">自主移动范围</div><div class="value">适中</div></div><div><div class="label">动作间隔</div><div class="muted">在「状态配置」里按状态分别设置</div></div></div></div>
+      <div class="card"><div class="section-h">外观</div><div class="grid g3"><div><div class="label">大小</div><div class="seg"><button>100%</button><button class="on">85%</button><button>72%</button><button>50%</button></div></div><div><div class="label">朝向</div><div class="seg"><button class="on">朝右</button><button>朝左</button></div></div><div><div class="label">置顶</div><span class="switch on"></span></div></div></div>
+      <div class="card"><div class="section-h">视频转换（默认参数）</div><p class="hint">从「导入动作」上传 mp4 时用。大多数情况不用改。</p><div class="grid g2"><div><div class="label">输出画布</div><div class="value">640 × 360</div></div><div><div class="label">去绿边强度</div><div class="value">90</div></div></div></div>
+      <div class="card"><div class="section-h">系统级（保存在配置文件）</div><div class="grid g2"><div><div class="label">数据文件</div><div class="value">~/Library/Application Support/deskpet/deskpet.db</div></div><div><div class="label">素材目录</div><div class="value">（随安装目录）</div></div><div><div class="label">端口</div><div class="value">18686</div></div><div><div class="label">开机自启</div><span class="switch"></span></div></div><p class="hint" style="margin:12px 0 0">这些是应用启动前就要读的路径/参数，放在配置文件里，建议不要直接改动。</p></div>
+    </section>
+  </main>
+</div>
+
+<script>
+  const titles={overview:['总览','看一眼桌宠现在怎么样'],pets:['宠物管理','管理桌宠、全身照与动作'],states:['状态配置','全局定义空闲 / 活跃 / 午休等状态'],settings:['设置','外观、行为与视频转换默认参数']};
+  document.querySelectorAll('.nav a').forEach(a=>a.addEventListener('click',()=>{document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('active'));a.classList.add('active');const k=a.dataset.nav;document.querySelectorAll('section[data-page]').forEach(s=>s.hidden=s.dataset.page!==k);document.getElementById('title').textContent=titles[k][0];document.getElementById('subtitle').textContent=titles[k][1];}));
+
+  // pets: enter detail
+  let view='grid';
+  function applyPetView(){document.getElementById('petGrid').hidden=view!=='grid';document.getElementById('petList').hidden=view!=='list';}
+  document.querySelectorAll('#petView button').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('#petView button').forEach(x=>x.classList.remove('on'));b.classList.add('on');view=b.dataset.v;applyPetView();}));
+
+  function openPet(name){document.getElementById('petsHome').style.display='none';document.getElementById('petsBody').style.display='none';document.getElementById('petDetail').hidden=false;document.getElementById('actBlock').hidden=false;document.getElementById('petDetail').querySelector('.pv').textContent=name==='小可'?'小可':'小蓝';}
+  document.querySelectorAll('[data-pet]').forEach(p=>p.addEventListener('click',()=>openPet(p.dataset.pet==='xiaoke'?'小可':'小蓝')));
+  document.getElementById('backBtn').addEventListener('click',()=>{document.getElementById('petDetail').hidden=true;document.getElementById('actBlock').hidden=true;document.getElementById('petsHome').style.display='';document.getElementById('petsBody').style.display='';});
+
+  // actions view toggle + trigger seg
+  document.querySelectorAll('#actView button').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('#actView button').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('actGrid').hidden=b.dataset.v!=='grid';document.getElementById('actList').hidden=b.dataset.v!=='list';}));
+  document.querySelectorAll('.seg button[data-t]').forEach(b=>b.addEventListener('click',()=>{b.parentElement.querySelectorAll('button[data-t]').forEach(x=>x.classList.remove('on'));b.classList.add('on');const pick=b.closest('.act').querySelector('#statePick');if(pick)pick.style.display=b.dataset.t==='state'?'':'none';}));
+
+  // edit toggle
+  document.getElementById('editBtn').addEventListener('click',()=>{document.getElementById('editPanel').style.display='block';});
+  document.getElementById('editCancel').addEventListener('click',()=>{document.getElementById('editPanel').style.display='none';});
+
+  document.querySelectorAll('.switch').forEach(s=>s.addEventListener('click',()=>s.classList.toggle('on')));
+  document.querySelectorAll('.seg').forEach(se=>se.addEventListener('click',e=>{const b=e.target.closest('button');if(b&&!b.dataset.t){se.querySelectorAll('button').forEach(x=>x.classList.remove('on'));b.classList.add('on');}}));
+</script>
+</body>
+</html>

@@ -6,9 +6,11 @@ mod log;
 mod app;
 mod assets;
 mod autostart;
+mod behavior;
 mod clip;
 mod config;
 mod control;
+mod convert;
 mod db;
 mod gfx;
 mod import;
@@ -18,6 +20,7 @@ mod pet;
 mod platform;
 mod single_instance;
 mod state;
+mod thumb;
 mod tray;
 mod vpx;
 mod webm;
@@ -52,7 +55,7 @@ fn main() {
 
     // 本地 HTTP 控制服务（管理前端 + JSON API）：命令通道 → 主线程 tick 排空
     let (api_tx, api_rx) = std::sync::mpsc::channel();
-    let mut app = app::App::new(api_rx);
+    let mut app = app::App::new(api_rx, api_tx.clone());
     let assets_root =
         crate::assets::resolve_assets_dir(app.cfg.sys.assets_dir.as_deref(), &app.cfg.dir);
     let port = app.cfg.sys.console_port.unwrap_or(18686);
@@ -60,6 +63,9 @@ fn main() {
     if app.console.is_none() {
         log_error!("控制服务启动失败（端口绑定失败）");
     }
+
+    // 补生成：为历史导入（尚缺全身照）的宠物自动取帧，保证控制台展示全身照
+    app.backfill_full_body_images();
 
     // 无素材时启动自动打开控制台，引导用户导入素材包
     if app.pet.is_none() {

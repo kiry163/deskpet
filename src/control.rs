@@ -40,17 +40,34 @@ pub enum ApiOp {
     /// POST /api/pet/say（气泡 + 时长）
     Say { text: String, duration_ms: Option<u64> },
     /// POST /api/import：素材 zip 已校验并解压落位，通知主线程注册桌宠并热加载
-    ApplyImport { id: String, videos: Vec<String> },
+    ApplyImport {
+        id: String,
+        videos: Vec<String>,
+        pet_name: Option<String>,
+        idle: Option<String>,
+        actions: Vec<crate::db::ActionRow>,
+        action_states: Vec<(String, String, f64, bool)>,
+    },
     /// GET /api/pets：桌宠列表
     PetsList,
     /// POST /api/pets/{id}/switch：切换当前桌宠（热生效）
     SwitchPet { id: String },
     /// DELETE /api/pets/{id}：删除桌宠（默认保留文件；delete_files=1 连带删除素材目录）
     DeletePet { id: String, delete_files: bool },
-    /// GET /api/pets/{id}/actions：桌宠动作配置（动画 → 触发类型/权重/启用）
+    /// GET /api/pets/{id}/actions：桌宠动作配置（归属 + 状态权重）
     GetPetActions { id: String },
-    /// PUT /api/pets/{id}/actions：保存动作配置（热生效）
-    SavePetActions { id: String, actions: Vec<(String, String, f64, bool)> },
+    /// PUT /api/pets/{id}/actions：保存动作配置（归属 + 状态权重，热生效）
+    SavePetActions { id: String, actions: Vec<crate::db::ActionRow>, action_states: Vec<(String, String, f64, bool)> },
+    /// PUT /api/pets/{id}/name：编辑桌宠显示名
+    UpdatePetName { id: String, name: String },
+    /// POST /api/pets/{id}/import/video：提交 mp4 绿幕转换作业（异步）
+    SubmitConvertJob { pet_id: String, action: String, owner: String, src_path: String, dest: String },
+    /// 转换线程上报进度
+    ConvertProgress { job_id: i64, progress: f64 },
+    /// 转换线程上报完成
+    ConvertDone { job_id: i64, pet_id: String, action: String, owner: String, ok: bool, error: Option<String> },
+    /// GET /api/pets/{id}/jobs：该宠物转换作业列表与进度
+    ConvertJobsList { pet_id: String },
     /// GET /api/settings：程序级配置
     GetSettings,
     /// PATCH /api/settings：保存程序级配置（热生效 + 落库）
@@ -246,10 +263,27 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
         (Method::Get, ["api", "pets", id, "actions"]) => {
             dispatch(req, app_tx, ApiOp::GetPetActions { id: (*id).to_string() });
         }
+        (Method::Put, ["api", "pets", id, "name"]) => {
+            let body = read_body(&mut req);
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            dispatch(req, app_tx, ApiOp::UpdatePetName { id: (*id).to_string(), name });
+        }
         (Method::Put, ["api", "pets", id, "actions"]) => {
             let body = read_body(&mut req);
-            let actions = parse_actions_body(&body);
-            dispatch(req, app_tx, ApiOp::SavePetActions { id: (*id).to_string(), actions });
+            let (actions, action_states) = parse_actions_body(&body);
+            dispatch(req, app_tx, ApiOp::SavePetActions { id: (*id).to_string(), actions, action_states });
+        }
+        (Method::Post, ["api", "pets", id, "import", "video"]) => {
+            handle_import_video(req, app_tx, assets_root, id);
+            return;
+        }
+        (Method::Get, ["api", "pets", id, "jobs"]) => {
+            dispatch(req, app_tx, ApiOp::ConvertJobsList { pet_id: (*id).to_string() });
+        }
+        (Method::Get, ["api", "pets", id, "fullbody"]) => {
+            handle_fullbody(req, assets_root, id);
+            return;
         }
         (Method::Get, ["api", "pets", id, "webm", action]) => {
             handle_webm(req, assets_root, id, action);
@@ -263,6 +297,28 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
         }
         (Method::Get, ["api", "system"]) => dispatch(req, app_tx, ApiOp::GetSystem),
         (Method::Post, ["api", "quit"]) => dispatch(req, app_tx, ApiOp::Quit),
+        // ---- 外部 Agent / 程序契约（/agent/*；能力 + 只读 state；不暴露 set_state 与管理端）----
+        (Method::Get, ["agent", "state"]) => dispatch(req, app_tx, ApiOp::State),
+        (Method::Post, ["agent", "play"]) => {
+            let body = read_body(&mut req);
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            dispatch(req, app_tx, ApiOp::Play(action));
+        }
+        (Method::Post, ["agent", "say"]) => {
+            let body = read_body(&mut req);
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let duration_ms = v.get("duration_ms").and_then(|x| x.as_u64());
+            dispatch(req, app_tx, ApiOp::Say { text, duration_ms });
+        }
+        (Method::Post, ["agent", "move"]) => {
+            let body = read_body(&mut req);
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
+            let y = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.5);
+            dispatch(req, app_tx, ApiOp::MoveTo { x, y });
+        }
         // 其余 GET 一律交给管理前端处理（内嵌 / 磁盘覆盖 / 404 兜底），
         // 保证 DESKPET_CONSOLE_DIR 下任意路径可访问
         (Method::Get, _) => serve_console(req, &path),
@@ -276,23 +332,35 @@ fn handle_request(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_ro
     }
 }
 
-/// 解析 PUT /api/pets/{id}/actions 的 body：`[{action, trigger, weight, enabled}]`。
-fn parse_actions_body(body: &[u8]) -> Vec<(String, String, f64, bool)> {
+/// 解析 PUT /api/pets/{id}/actions 的 body：
+/// `[{action, display_name, owner_kind, kind, enabled, states:[{state_id, weight, enabled}]}]`。
+fn parse_actions_body(body: &[u8]) -> (Vec<crate::db::ActionRow>, Vec<(String, String, f64, bool)>) {
+    let mut actions = Vec::new();
+    let mut action_states = Vec::new();
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return Vec::new();
+        return (actions, action_states);
     };
     let Some(arr) = v.as_array() else {
-        return Vec::new();
+        return (actions, action_states);
     };
-    arr.iter()
-        .filter_map(|item| {
-            let action = item.get("action")?.as_str()?.to_string();
-            let trigger = item.get("trigger").and_then(|x| x.as_str()).unwrap_or("idle_act").to_string();
-            let weight = item.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
-            let enabled = item.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
-            Some((action, trigger, weight, enabled))
-        })
-        .collect()
+    for item in arr {
+        let Some(action) = item.get("action").and_then(|x| x.as_str()) else { continue };
+        let display_name = item.get("display_name").and_then(|x| x.as_str()).unwrap_or(action).to_string();
+        let owner_kind = item.get("owner_kind").and_then(|x| x.as_str()).unwrap_or("state").to_string();
+        let kind = item.get("kind").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let enabled = item.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+        actions.push(crate::db::ActionRow { action: action.to_string(), display_name, owner_kind, kind, enabled });
+        if let Some(states) = item.get("states").and_then(|x| x.as_array()) {
+            for st in states {
+                if let Some(state_id) = st.get("state_id").and_then(|x| x.as_str()) {
+                    let weight = st.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                    let en = st.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                    action_states.push((action.to_string(), state_id.to_string(), weight, en));
+                }
+            }
+        }
+    }
+    (actions, action_states)
 }
 
 /// POST /api/import：素材 zip 上传（裸 body，Content-Type: application/zip）。
@@ -308,7 +376,14 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
         }
         Ok(report) => {
             let (tx, rx) = mpsc::channel::<Value>();
-            let op = ApiOp::ApplyImport { id: report.id.clone(), videos: report.videos.clone() };
+            let op = ApiOp::ApplyImport {
+                id: report.id.clone(),
+                videos: report.videos.clone(),
+                pet_name: report.pet_name.clone(),
+                idle: report.idle.clone(),
+                actions: report.actions.clone(),
+                action_states: report.action_states.clone(),
+            };
             if app_tx.send(ApiRequest { op, reply: tx }).is_err() {
                 let _ = req.respond(
                     Response::from_string(json!({"ok": false, "error": "app not ready"}).to_string())
@@ -325,7 +400,7 @@ fn handle_import(req: Request, app_tx: &mpsc::Sender<ApiRequest>, body: &[u8], a
                     "ok": true,
                     "data": {
                         "id": report.id,
-                        "display_name": report.display_name,
+                        "display_name": report.pet_name.clone().unwrap_or(report.display_name.clone()),
                         "videos": report.video_count,
                         "warnings": report.warnings,
                         "character": apply.get("data").and_then(|d| d.get("character")).cloned().unwrap_or(Value::Null),
@@ -360,6 +435,82 @@ fn handle_webm(req: Request, assets_root: &Path, pet_id: &str, action_raw: &str)
     match std::fs::read(&path) {
         Ok(bytes) => respond_bytes(req, 200, bytes, "video/webm"),
         Err(_) => bad(req, 404, &json!({"ok": false, "error": "animation not found"}).to_string()),
+    }
+}
+
+/// POST /api/pets/{id}/import/video?action=<动作名>&owner=<state|click|drag>：
+/// body = 绿幕 mp4 裸字节。落盘为 `<素材根>/<pet_id>/<action>.src.mp4`（.mp4 不参与 webm 扫描，
+/// 作业结束后清理），转交主线程提交**异步转换作业**。
+fn handle_import_video(mut req: Request, app_tx: &mpsc::Sender<ApiRequest>, assets_root: &Path, pet_id: &str) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    if pet_id.contains('/') || pet_id.contains('\\') || pet_id.contains("..") {
+        bad(req, 400, &json!({"ok": false, "error": "invalid pet id"}).to_string());
+        return;
+    }
+    let qs = req.url().split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+    let q = parse_query(&qs);
+    let action = percent_decode(q.get("action").map(String::as_str).unwrap_or("")).trim().to_string();
+    let owner = percent_decode(q.get("owner").map(String::as_str).unwrap_or("")).trim().to_string();
+    let owner = if owner == "click" || owner == "drag" { owner } else { "state".to_string() };
+    if action.is_empty() || action.contains('/') || action.contains('\\') || action.contains("..") {
+        bad(req, 400, &json!({"ok": false, "error": "invalid action (必填且不能含 / \\ .. )"}).to_string());
+        return;
+    }
+    let body = read_body(&mut req);
+    if body.is_empty() {
+        bad(req, 400, &json!({"ok": false, "error": "empty mp4 body"}).to_string());
+        return;
+    }
+    let pet_dir = assets_root.join(pet_id);
+    if let Err(e) = std::fs::create_dir_all(&pet_dir) {
+        bad(req, 500, &json!({"ok": false, "error": format!("创建素材目录失败: {}", e)}).to_string());
+        return;
+    }
+    let src_path = pet_dir.join(format!("{}.src.mp4", action));
+    if let Err(e) = std::fs::write(&src_path, &body) {
+        bad(req, 500, &json!({"ok": false, "error": format!("写入 mp4 失败: {}", e)}).to_string());
+        return;
+    }
+    let dest = action.clone();
+    let (tx, rx) = mpsc::channel::<Value>();
+    if app_tx
+        .send(ApiRequest {
+            op: ApiOp::SubmitConvertJob {
+                pet_id: pet_id.to_string(),
+                action,
+                owner,
+                src_path: src_path.to_string_lossy().to_string(),
+                dest,
+            },
+            reply: tx,
+        })
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&src_path);
+        bad(req, 503, &json!({"ok": false, "error": "app not ready"}).to_string());
+        return;
+    }
+    let resp = rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or(json!({"ok": false, "error": "timeout"}));
+    let _ = req.respond(Response::from_string(resp.to_string()).with_header(json_header()));
+}
+
+/// GET /api/pets/{id}/fullbody：返回该桌宠的全身照（导入时自动从待机动画取帧的 PNG）。
+fn handle_fullbody(req: Request, assets_root: &Path, pet_id: &str) {
+    let bad = |req: Request, code: u32, msg: &str| {
+        respond_bytes(req, code, msg.as_bytes().to_vec(), "application/json; charset=utf-8")
+    };
+    if pet_id.contains('/') || pet_id.contains('\\') || pet_id.contains("..") {
+        bad(req, 400, &json!({"ok": false, "error": "invalid pet id"}).to_string());
+        return;
+    }
+    let path = assets_root.join(pet_id).join("fullbody.png");
+    match std::fs::read(&path) {
+        Ok(bytes) => respond_bytes(req, 200, bytes, "image/png"),
+        Err(_) => bad(req, 404, &json!({"ok": false, "error": "full body image not found"}).to_string()),
     }
 }
 

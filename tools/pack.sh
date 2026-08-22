@@ -47,7 +47,8 @@ fi
 if [ "${1:-}" != "--no-build" ]; then
   echo "构建 release..."
   # shellcheck disable=SC2086
-  cargo build --release $CARGO_EXTRA
+  # shellcheck disable=SC2154
+  cargo build --release ${CARGO_EXTRA:-}
 fi
 
 bin="target/release/deskpet"
@@ -118,16 +119,21 @@ deskpet 桌宠 v${version}（macOS ${arch}）
 2. 双击 deskpet.app 启动（如被 Gatekeeper 拦截：右键 deskpet.app → 打开）；
 3. 状态栏图标 → 菜单「打开控制台」，浏览器打开管理界面
    （地址也可读 ~/Library/Application Support/deskpet/control.json 中的 url）；
-4. 控制台「导入」页上传素材 zip 包（zip 根 = manifest.json + videos/），
-   校验通过后自动解压到素材根并热加载（无需重启）。
+4. 控制台「导入」页上传素材 zip 包（zip 内为 VP9+alpha webm 文件，递归扫描，
+   无 manifest/videos 结构要求），校验通过后自动解压到素材根并热加载（无需重启）。
 
 退出：状态栏图标右键菜单 → 退出。
 日志：~/Library/Application Support/deskpet/logs/deskpet.log（超 1MB 自动滚动为 .old）
-配置：~/Library/Application Support/deskpet/config.json（assets_dir / character 可覆盖）
+配置：~/Library/Application Support/deskpet/deskpet.yaml（系统级引导）
+     + ~/Library/Application Support/deskpet/deskpet.db（程序级/桌宠级，SQLite）
 自启：菜单「开机自启」写入 ~/Library/LaunchAgents/com.kiry.deskpet.plist
 
-素材规范：zip 根目录即角色包 —— manifest.json + videos/（VP9+alpha webm），
-详见项目 docs/需求规格.md §3。
+素材规范：zip 内全部为 VP9+alpha 透明 webm（动画文件），动作分类在控制台
+「桌宠管理」页配置，详见项目 docs/需求规格.md。
+
+从视频新建动作（mp4 绿幕 转 webm）：控制台「桌宠管理」→ 宠物 → 「＋ 导入动作」。
+需要本机安装 ffmpeg / ffprobe：macOS 用 brew install ffmpeg 安装（或启动桌宠前用
+环境变量 DESKPET_FFMPEG 指向 ffmpeg 可执行文件）。程序会自动探测常见 Homebrew 路径。
 
 本软件以 MIT 许可发布（见 LICENSE）。
 动画与交互设计源自 ianlike-ui/dsh-pet-standalone（MIT）、PC2005-cloud/dsh-pet（MIT）

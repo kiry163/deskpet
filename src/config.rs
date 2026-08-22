@@ -71,15 +71,9 @@ pub struct PetConfig {
     /// 当前桌宠（素材集 id）；None = 未导入。
     pub character: Option<String>,
 
-    // ---- 行为引擎参数（阶段 3，替换 state.rs 硬编码常量；见 docs/需求规格.md §5.2）----
-    /// 闲时占比：待机分支概率（0..1，须 < turn_ratio）。
-    pub idle_ratio: f64,
-    /// 转向分支累积概率（idle_ratio < turn_ratio < act_ratio）。
-    pub turn_ratio: f64,
-    /// 闲时动作分支累积概率（turn_ratio < act_ratio <= 1；剩余为移动）。
-    pub act_ratio: f64,
-    /// 动作触发间隔（普通动画结束后停顿的毫秒数；0 = 立即继续）。
-    pub act_interval_ms: u64,
+    // ---- 状态机行为（程序级，替换扁平占比；见 docs/行为状态机设计.md）----
+    /// 状态集合（内置 idle/active + 默认 lunch，用户可编辑；含每状态 weight/time_rules/interval）。
+    pub behavior_states: Vec<crate::behavior::StateDef>,
     /// 自主移动最小距离（像素）。
     pub move_min_px: f64,
     /// 自主移动最大距离（像素）。
@@ -100,10 +94,7 @@ impl Default for PetConfig {
             always_on_top: true,
             no_move: false,
             character: None,
-            idle_ratio: 0.30,
-            turn_ratio: 0.40,
-            act_ratio: 0.80,
-            act_interval_ms: 0,
+            behavior_states: crate::behavior::default_states(),
             move_min_px: 60.0,
             move_max_px: 240.0,
             move_margin_px: 20.0,
@@ -113,12 +104,8 @@ impl Default for PetConfig {
 }
 
 impl PetConfig {
-    /// 行为参数归一化（防手改/非法值）：ratio 排序钳制、缩放档位去重排序。
+    /// 行为参数归一化（防手改/非法值）：缩放档位去重排序、移动范围钳制。
     pub fn normalize_behavior(&mut self) {
-        let clamp01 = |v: f64| v.clamp(0.0, 1.0);
-        self.idle_ratio = clamp01(self.idle_ratio);
-        self.turn_ratio = clamp01(self.turn_ratio).max(self.idle_ratio);
-        self.act_ratio = clamp01(self.act_ratio).max(self.turn_ratio);
         self.move_min_px = self.move_min_px.clamp(0.0, 1000.0);
         self.move_max_px = self.move_max_px.clamp(self.move_min_px, 2000.0);
         self.move_margin_px = self.move_margin_px.clamp(0.0, 500.0);
@@ -224,11 +211,8 @@ impl Config {
                 .map(|s| format!("\"{}\"", s))
                 .unwrap_or_else(|| "null".to_string()),
         );
-        // 行为引擎参数
-        let _ = db.set_setting("idle_ratio", &format!("{}", self.pet.idle_ratio));
-        let _ = db.set_setting("turn_ratio", &format!("{}", self.pet.turn_ratio));
-        let _ = db.set_setting("act_ratio", &format!("{}", self.pet.act_ratio));
-        let _ = db.set_setting("act_interval_ms", &format!("{}", self.pet.act_interval_ms));
+        // 行为（状态集合 + 移动/缩放参数）
+        let _ = db.set_setting("behavior", &serde_json::to_string(&self.pet.behavior_states).unwrap_or_default());
         let _ = db.set_setting("move_min_px", &format!("{}", self.pet.move_min_px));
         let _ = db.set_setting("move_max_px", &format!("{}", self.pet.move_max_px));
         let _ = db.set_setting("move_margin_px", &format!("{}", self.pet.move_margin_px));
@@ -272,18 +256,11 @@ fn load_pet_config(db: &Db) -> PetConfig {
             pc.character = Some(c.to_string());
         }
     }
-    // 行为引擎参数（缺省用默认值）
-    if let Some(v) = s.get("idle_ratio").and_then(|x| x.parse::<f64>().ok()) {
-        pc.idle_ratio = v;
-    }
-    if let Some(v) = s.get("turn_ratio").and_then(|x| x.parse::<f64>().ok()) {
-        pc.turn_ratio = v;
-    }
-    if let Some(v) = s.get("act_ratio").and_then(|x| x.parse::<f64>().ok()) {
-        pc.act_ratio = v;
-    }
-    if let Some(v) = s.get("act_interval_ms").and_then(|x| x.parse::<u64>().ok()) {
-        pc.act_interval_ms = v;
+    // 行为（状态集合 / 移动 / 缩放；缺省用默认值）
+    if let Some(v) = s.get("behavior").and_then(|x| serde_json::from_str::<Vec<crate::behavior::StateDef>>(x).ok()) {
+        if !v.is_empty() {
+            pc.behavior_states = v;
+        }
     }
     if let Some(v) = s.get("move_min_px").and_then(|x| x.parse::<f64>().ok()) {
         pc.move_min_px = v;
